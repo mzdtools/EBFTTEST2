@@ -1,74 +1,45 @@
 -- ============================================
--- MzD Tower Trial Farm (STANDALONE - NO LIB)
+-- MzD Hub v16.0 (Native GUI Edition)
 -- ============================================
--- Als dit niet werkt, is je executor kapot.
-print("MzD Script gestart...")
+-- 100% Executor Safe - Geen externe libraries
+-- ============================================
 
 local Players = game:GetService("Players")
 local Player = Players.LocalPlayer
 local RunService = game:GetService("RunService")
 local TweenService = game:GetService("TweenService")
 local CoreGui = game:GetService("CoreGui")
+local UserInputService = game:GetService("UserInputService")
 
--- 1. MAAK EEN SIMPELE GUI (GEEN LOADSTRINGS)
-local ScreenGui = Instance.new("ScreenGui")
-ScreenGui.Name = "MzD_Standalone"
--- Probeer CoreGui, anders PlayerGui (voor veiligheid)
-pcall(function() ScreenGui.Parent = CoreGui end)
-if not ScreenGui.Parent then ScreenGui.Parent = Player:WaitForChild("PlayerGui") end
+-- ============================================
+-- 1. VARIABELEN & SETTINGS
+-- ============================================
+local S = {
+    Farming = false,
+    TowerTrial = false,
+    GodMode = false,
+    Events = false,
+    TargetRarity = "Common", -- Standaard
+    WalkY = 0,
+    Status = "Idle"
+}
 
-local MainFrame = Instance.new("Frame")
-MainFrame.Name = "MainFrame"
-MainFrame.Size = UDim2.new(0, 200, 0, 150)
-MainFrame.Position = UDim2.new(0, 50, 0, 50) -- Links boven
-MainFrame.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
-MainFrame.BorderSizePixel = 2
-MainFrame.BorderColor3 = Color3.fromRGB(255, 0, 0)
-MainFrame.Active = true
-MainFrame.Draggable = true
-MainFrame.Parent = ScreenGui
+local Threads = {
+    Farm = nil,
+    Trial = nil,
+    God = nil,
+    Events = nil
+}
 
-local Title = Instance.new("TextLabel")
-Title.Text = "MzD Tower Farm"
-Title.Size = UDim2.new(1, 0, 0, 30)
-Title.BackgroundColor3 = Color3.fromRGB(50, 50, 50)
-Title.TextColor3 = Color3.fromRGB(255, 255, 255)
-Title.Parent = MainFrame
+-- Lijstjes voor cyclen
+local RARITIES = {"Common", "Uncommon", "Rare", "Epic", "Legendary", "Mythical", "Any"}
+local RarityIndex = 1
 
-local StatusLabel = Instance.new("TextLabel")
-StatusLabel.Text = "Status: Idle"
-StatusLabel.Size = UDim2.new(1, 0, 0, 30)
-StatusLabel.Position = UDim2.new(0, 0, 0, 35)
-StatusLabel.TextColor3 = Color3.fromRGB(255, 255, 0)
-StatusLabel.BackgroundTransparency = 1
-StatusLabel.Parent = MainFrame
+-- ============================================
+-- 2. FUNCTIES (LOGICA)
+-- ============================================
 
-local ToggleBtn = Instance.new("TextButton")
-ToggleBtn.Text = "START FARM"
-ToggleBtn.Size = UDim2.new(0.9, 0, 0, 40)
-ToggleBtn.Position = UDim2.new(0.05, 0, 0.7, 0)
-ToggleBtn.BackgroundColor3 = Color3.fromRGB(0, 150, 0)
-ToggleBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
-ToggleBtn.Parent = MainFrame
-
-local CloseBtn = Instance.new("TextButton")
-CloseBtn.Text = "X"
-CloseBtn.Size = UDim2.new(0, 20, 0, 20)
-CloseBtn.Position = UDim2.new(1, -25, 0, 5)
-CloseBtn.BackgroundColor3 = Color3.fromRGB(200, 0, 0)
-CloseBtn.Parent = MainFrame
-
-CloseBtn.MouseButton1Click:Connect(function()
-    ScreenGui:Destroy()
-end)
-
--- 2. LOGICA
-local Farming = false
-
-local function setStatus(txt)
-    StatusLabel.Text = txt
-end
-
+-- Veilig prompten (werkt op elke executor)
 local function safePrompt(prompt)
     if not prompt then return end
     pcall(function()
@@ -86,117 +57,390 @@ local function safePrompt(prompt)
     end)
 end
 
+-- Teleport (Tween of CFrame)
 local function tp(cf)
     local hrp = Player.Character and Player.Character:FindFirstChild("HumanoidRootPart")
-    if hrp then
-        hrp.CFrame = cf
+    if not hrp then return end
+    
+    local target = cf
+    if S.GodMode then
+        target = CFrame.new(cf.Position.X, S.WalkY, cf.Position.Z)
+    end
+    
+    hrp.CFrame = target
+end
+
+-- Update Status in GUI
+local function setStatus(txt)
+    S.Status = txt
+    if getgenv().MzD_StatusLabel then
+        getgenv().MzD_StatusLabel.Text = "Status: " .. txt
     end
 end
 
-local function getTower()
-    return workspace:FindFirstChild("GameObjects") and workspace.GameObjects:FindFirstChild("PlaceSpecific") and workspace.GameObjects.PlaceSpecific:FindFirstChild("root") and workspace.GameObjects.PlaceSpecific.root:FindFirstChild("Tower")
-end
+-- === TOWER TRIAL LOGICA ===
+local function runTowerTrial()
+    setStatus("Tower Trial Start...")
+    while S.TowerTrial do
+        pcall(function()
+            local tower = workspace:FindFirstChild("GameObjects") and workspace.GameObjects:FindFirstChild("PlaceSpecific") and workspace.GameObjects.PlaceSpecific:FindFirstChild("root") and workspace.GameObjects.PlaceSpecific.root:FindFirstChild("Tower")
+            
+            if not tower then
+                -- Fallback zoekfunctie
+                for _, o in pairs(workspace:GetDescendants()) do if o.Name == "Tower" and o:IsA("Model") then tower = o break end end
+            end
 
-local function getHUD()
-    return Player.PlayerGui:FindFirstChild("TowerTrialHUD") and Player.PlayerGui.TowerTrialHUD:FindFirstChild("TrialBar")
-end
+            if not tower then
+                setStatus("⚠️ Geen Tower!")
+                task.wait(2)
+                return
+            end
 
--- 3. DE FARM LOOP
-ToggleBtn.MouseButton1Click:Connect(function()
-    Farming = not Farming
-    if Farming then
-        ToggleBtn.Text = "STOP FARM"
-        ToggleBtn.BackgroundColor3 = Color3.fromRGB(150, 0, 0)
-        
-        task.spawn(function()
-            while Farming do
-                local tower = getTower()
-                if not tower then
-                    setStatus("Tower niet gevonden!")
-                    task.wait(1)
+            local hud = Player.PlayerGui:FindFirstChild("TowerTrialHUD") and Player.PlayerGui.TowerTrialHUD:FindFirstChild("TrialBar")
+            local timer = hud and hud:FindFirstChild("Timer") and hud.Timer.Text
+            local active = (timer and timer ~= "" and timer ~= "00:00")
+
+            if not active then
+                setStatus("🏁 Activeren...")
+                tp(tower:GetPivot() * CFrame.new(0, 5, 0))
+                task.wait(0.3)
+                for _, d in pairs(tower:GetDescendants()) do if d:IsA("ProximityPrompt") then safePrompt(d) end end
+                task.wait(1.5)
+            else
+                local reqLabel = hud:FindFirstChild("Requirement")
+                local reqTxt = reqLabel and reqLabel.Text or ""
+                local rarity = reqTxt:match("Tower Trial:%s*(.+)") or "Common"
+                
+                local depLabel = hud:FindFirstChild("Deposits")
+                local curStr = depLabel and depLabel.Text or "0/10"
+                local cur = tonumber(curStr:match("(%d+)/")) or 0
+
+                if cur >= 10 then
+                    setStatus("🎉 KLAAR! Claimen...")
+                    pcall(function()
+                        game:GetService("ReplicatedStorage").Shared.Remotes.Networking["RE/Tower/TowerClaimConfirmed"]:FireServer()
+                    end)
+                    task.wait(2)
                 else
-                    local hud = getHUD()
-                    -- Check of trial actief is (Timer text)
-                    local timer = hud and hud:FindFirstChild("Timer") and hud.Timer.Text
-                    local active = (timer and timer ~= "" and timer ~= "00:00")
-                    
-                    if not active then
-                        setStatus("Activeren...")
-                        tp(tower:GetPivot() * CFrame.new(0, 5, 0))
-                        task.wait(0.2)
-                        for _, d in pairs(tower:GetDescendants()) do
-                            if d:IsA("ProximityPrompt") then safePrompt(d) end
-                        end
-                        task.wait(1)
-                    else
-                        -- Trial is actief, zoek brainrot
-                        local req = hud:FindFirstChild("Requirement")
-                        local reqTxt = req and req.Text or ""
-                        local rarity = reqTxt:match("Tower Trial:%s*(.+)") or "Common"
-                        
-                        -- Check deposits
-                        local dep = hud:FindFirstChild("Deposits")
-                        local curStr = dep and dep.Text or "0/10"
-                        local cur = tonumber(curStr:match("(%d+)/")) or 0
-                        
-                        if cur >= 10 then
-                            setStatus("Klaar! Wachten...")
-                            -- Probeer claim
-                            pcall(function()
-                                local r = game:GetService("ReplicatedStorage").Shared.Remotes.Networking["RE/Tower/TowerClaimConfirmed"]
-                                r:FireServer()
-                            end)
-                            task.wait(2)
-                        else
-                            setStatus("Zoek: " .. rarity)
-                            local found = false
-                            local ab = workspace:FindFirstChild("ActiveBrainrots")
-                            if ab then
-                                for _, f in pairs(ab:GetChildren()) do
-                                    if f.Name == rarity then
-                                        for _, b in pairs(f:GetChildren()) do
-                                            local root = b:FindFirstChild("Root") or b:FindFirstChild("RenderedBrainrot")
-                                            if root then
-                                                if root:IsA("Model") then root = root:FindFirstChild("Root") end
-                                                if root then
-                                                    found = true
-                                                    -- Pakken
-                                                    tp(root.CFrame * CFrame.new(0,3,0))
-                                                    task.wait(0.3)
-                                                    for _, p in pairs(b:GetDescendants()) do
-                                                        if p:IsA("ProximityPrompt") then safePrompt(p) end
-                                                    end
-                                                    task.wait(0.5)
-                                                    -- Inleveren
-                                                    tp(tower:GetPivot() * CFrame.new(0, 5, 0))
-                                                    task.wait(0.5)
-                                                    for _, p in pairs(tower:GetDescendants()) do
-                                                        if p:IsA("ProximityPrompt") then safePrompt(p) end
-                                                    end
-                                                    task.wait(1)
-                                                    break
-                                                end
-                                            end
+                    setStatus("🧠 Zoek: " .. rarity .. " ("..cur.."/10)")
+                    local found = false
+                    local ab = workspace:FindFirstChild("ActiveBrainrots")
+                    if ab then
+                        for _, f in pairs(ab:GetChildren()) do
+                            if f.Name == rarity then
+                                for _, b in pairs(f:GetChildren()) do
+                                    local root = b:FindFirstChild("Root") or b:FindFirstChild("RenderedBrainrot")
+                                    if root then
+                                        if root:IsA("Model") then root = root:FindFirstChild("Root") end
+                                        if root then
+                                            found = true
+                                            tp(root.CFrame * CFrame.new(0,3,0))
+                                            task.wait(0.3)
+                                            for _, p in pairs(b:GetDescendants()) do if p:IsA("ProximityPrompt") then safePrompt(p) end end
+                                            task.wait(0.5)
+                                            tp(tower:GetPivot() * CFrame.new(0, 5, 0))
+                                            task.wait(0.5)
+                                            for _, p in pairs(tower:GetDescendants()) do if p:IsA("ProximityPrompt") then safePrompt(p) end end
+                                            task.wait(1)
+                                            break
                                         end
                                     end
-                                    if found then break end
                                 end
                             end
-                            if not found then
-                                setStatus("Geen " .. rarity .. " gevonden")
-                                task.wait(1)
-                            end
+                            if found then break end
+                        end
+                    end
+                    if not found then
+                        setStatus("⏳ Geen " .. rarity .. "...")
+                        task.wait(1.5)
+                    end
+                end
+            end
+        end)
+        task.wait(0.1)
+    end
+end
+
+-- === GOD MODE LOGICA ===
+local function runGodMode()
+    -- Verstop kill parts
+    task.spawn(function()
+        while S.GodMode do
+            pcall(function()
+                for _, v in pairs(workspace:GetDescendants()) do
+                    if v:IsA("BasePart") and (v.Name:lower():find("kill") or v.Name:lower():find("damage")) then
+                        v.CanTouch = false
+                        v.CanCollide = false
+                        v.Transparency = 0.8
+                    end
+                end
+                -- Verstop vloeren voor visual
+                local map = nil
+                for _, c in pairs(workspace:GetChildren()) do if c.Name:find("Map") and not c.Name:find("Shared") then map = c break end end
+                if map then
+                    for _, d in pairs(map:GetDescendants()) do
+                        if d:IsA("BasePart") and (d.Name == "BridgeFloor" or d.Name == "FirstFloor" or d.Name == "Ground") then
+                            d.CanCollide = false
+                            d.Transparency = 0.9
                         end
                     end
                 end
-                task.wait(0.2)
+            end)
+            task.wait(1)
+        end
+    end)
+    
+    -- Loop handler
+    while S.GodMode do
+        pcall(function()
+            local hrp = Player.Character:FindFirstChild("HumanoidRootPart")
+            if hrp then
+                -- Forceer hoogte als we vallen
+                if hrp.Position.Y < S.WalkY - 5 then
+                    hrp.CFrame = CFrame.new(hrp.Position.X, S.WalkY, hrp.Position.Z)
+                    hrp.Velocity = Vector3.zero
+                end
+                -- Forceer state
+                local hum = Player.Character:FindFirstChild("Humanoid")
+                if hum then
+                    hum:ChangeState(Enum.HumanoidStateType.Running)
+                    hum.Health = hum.MaxHealth
+                end
             end
         end)
+        task.wait()
+    end
+end
+
+-- === FARM LOGICA (Brainrots) ===
+local function runFarm()
+    setStatus("Farm Start...")
+    while S.Farming do
+        pcall(function()
+            local ab = workspace:FindFirstChild("ActiveBrainrots")
+            local found = false
+            if ab then
+                for _, f in pairs(ab:GetChildren()) do
+                    if S.TargetRarity == "Any" or f.Name == S.TargetRarity then
+                        for _, b in pairs(f:GetChildren()) do
+                            local root = b:FindFirstChild("Root") or b:FindFirstChild("RenderedBrainrot")
+                            if root then
+                                if root:IsA("Model") then root = root:FindFirstChild("Root") end
+                                if root then
+                                    found = true
+                                    setStatus("Pakken: " .. f.Name)
+                                    tp(root.CFrame * CFrame.new(0,3,0))
+                                    task.wait(0.3)
+                                    for _, p in pairs(b:GetDescendants()) do if p:IsA("ProximityPrompt") then safePrompt(p) end end
+                                    task.wait(0.2)
+                                    -- Base slot droppen (simpel: slot 5)
+                                    -- Voor nu alleen collecten om errors te voorkomen in simple mode
+                                    break
+                                end
+                            end
+                        end
+                    end
+                    if found then break end
+                end
+            end
+            if not found then
+                setStatus("Zoeken naar " .. S.TargetRarity .. "...")
+                task.wait(1)
+            end
+        end)
+        task.wait(0.2)
+    end
+end
+
+
+-- ============================================
+-- 3. DE GUI (Native Roblox UI)
+-- ============================================
+
+-- Oude opruimen
+pcall(function() game.CoreGui.MzD_Native_v16:Destroy() end)
+pcall(function() Player.PlayerGui.MzD_Native_v16:Destroy() end)
+
+local ScreenGui = Instance.new("ScreenGui")
+ScreenGui.Name = "MzD_Native_v16"
+-- Probeer CoreGui voor veiligheid, anders PlayerGui
+if pcall(function() ScreenGui.Parent = CoreGui end) then else ScreenGui.Parent = Player.PlayerGui end
+
+-- === MAIN FRAME ===
+local Main = Instance.new("Frame")
+Main.Name = "Main"
+Main.Size = UDim2.new(0, 320, 0, 260) -- Iets breder voor mobiel
+Main.Position = UDim2.new(0.5, -160, 0.5, -130) -- Center
+Main.BackgroundColor3 = Color3.fromRGB(25, 25, 35)
+Main.BorderSizePixel = 0
+Main.Active = true
+Main.Draggable = true
+Main.Parent = ScreenGui
+
+-- Rounded corners
+local UICorner = Instance.new("UICorner")
+UICorner.CornerRadius = UDim.new(0, 10)
+UICorner.Parent = Main
+
+-- Title Bar
+local Title = Instance.new("TextLabel")
+Title.Text = "  MzD Hub v16.0 (Native)"
+Title.Size = UDim2.new(1, -40, 0, 30)
+Title.BackgroundColor3 = Color3.fromRGB(40, 40, 55)
+Title.TextColor3 = Color3.fromRGB(255, 255, 255)
+Title.Font = Enum.Font.GothamBold
+Title.TextSize = 14
+Title.TextXAlignment = Enum.TextXAlignment.Left
+Title.Parent = Main
+local TitleCorn = Instance.new("UICorner")
+TitleCorn.CornerRadius = UDim.new(0, 10)
+TitleCorn.Parent = Title
+
+-- Close/Minimize Button
+local MinBtn = Instance.new("TextButton")
+MinBtn.Text = "-"
+MinBtn.Size = UDim2.new(0, 30, 0, 30)
+MinBtn.Position = UDim2.new(1, -35, 0, 0)
+MinBtn.BackgroundColor3 = Color3.fromRGB(200, 50, 50)
+MinBtn.TextColor3 = Color3.white
+MinBtn.Font = Enum.Font.GothamBold
+MinBtn.Parent = Main
+local MinCorn = Instance.new("UICorner")
+MinCorn.CornerRadius = UDim.new(0, 8)
+MinCorn.Parent = MinBtn
+
+local Minimized = false
+MinBtn.MouseButton1Click:Connect(function()
+    Minimized = not Minimized
+    if Minimized then
+        Main:TweenSize(UDim2.new(0, 320, 0, 30), "Out", "Quad", 0.3, true)
+        MinBtn.Text = "+"
+        MinBtn.BackgroundColor3 = Color3.fromRGB(50, 200, 50)
     else
-        ToggleBtn.Text = "START FARM"
-        ToggleBtn.BackgroundColor3 = Color3.fromRGB(0, 150, 0)
-        setStatus("Gestopt")
+        Main:TweenSize(UDim2.new(0, 320, 0, 260), "Out", "Quad", 0.3, true)
+        MinBtn.Text = "-"
+        MinBtn.BackgroundColor3 = Color3.fromRGB(200, 50, 50)
     end
 end)
 
-print("MzD: GUI geladen. Kijk linksboven.")
+-- === CONTAINER ===
+local Container = Instance.new("ScrollingFrame")
+Container.Size = UDim2.new(1, -10, 1, -40)
+Container.Position = UDim2.new(0, 5, 0, 35)
+Container.BackgroundTransparency = 1
+Container.ScrollBarThickness = 4
+Container.Parent = Main
+
+local UIList = Instance.new("UIListLayout")
+UIList.Padding = UDim.new(0, 5)
+UIList.SortOrder = Enum.SortOrder.LayoutOrder
+UIList.Parent = Container
+
+-- Helper function for Buttons
+local function createToggle(text, callback)
+    local btn = Instance.new("TextButton")
+    btn.Size = UDim2.new(1, 0, 0, 35)
+    btn.BackgroundColor3 = Color3.fromRGB(45, 45, 60)
+    btn.Text = "  " .. text .. " [UIT]"
+    btn.TextColor3 = Color3.fromRGB(200, 200, 200)
+    btn.Font = Enum.Font.Gotham
+    btn.TextSize = 14
+    btn.TextXAlignment = Enum.TextXAlignment.Left
+    btn.Parent = Container
+    local c = Instance.new("UICorner"); c.CornerRadius = UDim.new(0, 6); c.Parent = btn
+    
+    local on = false
+    btn.MouseButton1Click:Connect(function()
+        on = not on
+        if on then
+            btn.Text = "  " .. text .. " [AAN]"
+            btn.BackgroundColor3 = Color3.fromRGB(40, 100, 60)
+            btn.TextColor3 = Color3.white
+        else
+            btn.Text = "  " .. text .. " [UIT]"
+            btn.BackgroundColor3 = Color3.fromRGB(45, 45, 60)
+            btn.TextColor3 = Color3.fromRGB(200, 200, 200)
+        end
+        callback(on)
+    end)
+    return btn
+end
+
+local function createCycle(text, values, callback)
+    local btn = Instance.new("TextButton")
+    btn.Size = UDim2.new(1, 0, 0, 35)
+    btn.BackgroundColor3 = Color3.fromRGB(45, 45, 60)
+    btn.Text = "  " .. text .. ": " .. values[1]
+    btn.TextColor3 = Color3.fromRGB(255, 200, 100)
+    btn.Font = Enum.Font.Gotham
+    btn.TextSize = 14
+    btn.TextXAlignment = Enum.TextXAlignment.Left
+    btn.Parent = Container
+    local c = Instance.new("UICorner"); c.CornerRadius = UDim.new(0, 6); c.Parent = btn
+    
+    local idx = 1
+    btn.MouseButton1Click:Connect(function()
+        idx = idx + 1
+        if idx > #values then idx = 1 end
+        btn.Text = "  " .. text .. ": " .. values[idx]
+        callback(values[idx])
+    end)
+end
+
+-- === CONTROLS TOEVOEGEN ===
+
+-- 1. Tower Trial
+createToggle("🏆 Auto Tower Trial", function(val)
+    S.TowerTrial = val
+    if val then
+        Threads.Trial = task.spawn(runTowerTrial)
+    else
+        setStatus("Idle")
+    end
+end)
+
+-- 2. Farm Rarity
+createCycle("⭐ Farm Rarity", RARITIES, function(val)
+    S.TargetRarity = val
+end)
+
+-- 3. Brainrot Farm
+createToggle("🌾 Auto Brainrot Farm", function(val)
+    S.Farming = val
+    if val then
+        Threads.Farm = task.spawn(runFarm)
+    else
+        setStatus("Idle")
+    end
+end)
+
+-- 4. God Mode
+createToggle("😇 God Mode (No Clip/Kill)", function(val)
+    S.GodMode = val
+    if val then
+        Threads.God = task.spawn(runGodMode)
+    else
+        -- Reset char
+        local hrp = Player.Character:FindFirstChild("HumanoidRootPart")
+        if hrp then hrp.CFrame = CFrame.new(hrp.Position.X, 10, hrp.Position.Z) end
+    end
+end)
+
+-- 5. Walk Y Height
+createCycle("↕️ God Walk Y", {"0", "5", "10", "-5", "-10"}, function(val)
+    S.WalkY = tonumber(val)
+end)
+
+
+-- STATUS LABEL
+getgenv().MzD_StatusLabel = Instance.new("TextLabel")
+getgenv().MzD_StatusLabel.Text = "Status: Idle"
+getgenv().MzD_StatusLabel.Size = UDim2.new(1, 0, 0, 20)
+getgenv().MzD_StatusLabel.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
+getgenv().MzD_StatusLabel.TextColor3 = Color3.fromRGB(255, 255, 0)
+getgenv().MzD_StatusLabel.Font = Enum.Font.Code
+getgenv().MzD_StatusLabel.TextSize = 12
+getgenv().MzD_StatusLabel.Parent = Main
+getgenv().MzD_StatusLabel.Position = UDim2.new(0, 0, 1, -25)
+
+print("MzD v16.0 Native Loaded!")
