@@ -1,0 +1,2365 @@
+-- ============================================
+-- MzD Hub v13.0
+-- OPTIMALISATIES:
+--   1. Nil-checks op firetouchinterest / fireproximityprompt overal
+--   2. Local service lookups bovenaan (performance)
+--   3. Valentine + Candy collector samengevoegd tot 1 generieke functie
+--   4. Headers / modulaire structuur voor overzicht
+-- ============================================
+
+-- ============================================
+-- [MODULE 1] LOCAL SERVICE LOOKUPS
+-- ============================================
+local Players           = game:GetService("Players")
+local TweenService      = game:GetService("TweenService")
+local RunService        = game:GetService("RunService")
+local UserInputService  = game:GetService("UserInputService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+-- Executor-safe wrappers
+local _fti = firetouchinterest   or nil
+local _fpp = fireproximityprompt or nil
+
+local function safeTouchInterest(hrp, part, state)
+    if _fti and hrp and part and part.Parent then
+        pcall(_fti, hrp, part, state)
+    end
+end
+
+local function safeFirePrompt(prompt)
+    if not prompt then return end
+    pcall(function()
+        prompt.HoldDuration          = 0
+        prompt.MaxActivationDistance = 99999
+        prompt.RequiresLineOfSight   = false
+        prompt.Enabled               = true
+    end)
+    if _fpp then pcall(_fpp, prompt) end
+end
+
+local function fireAllPrompts(parent)
+    if not parent then return end
+    for _, d in pairs(parent:GetDescendants()) do
+        if d:IsA("ProximityPrompt") then safeFirePrompt(d) end
+    end
+end
+
+local function touchAllParts(hrp, parent)
+    if not hrp or not parent then return end
+    for _, d in pairs(parent:GetDescendants()) do
+        if d:IsA("BasePart") then
+            safeTouchInterest(hrp, d, 0)
+            safeTouchInterest(hrp, d, 1)
+        end
+    end
+end
+
+local Player = Players.LocalPlayer
+
+-- ============================================
+-- [MODULE 2] GLOBAL STATE & SETTINGS
+-- ============================================
+getgenv().MzD = {}
+local M = getgenv().MzD
+
+M.ActiveBrainrots   = workspace:FindFirstChild("ActiveBrainrots")
+M.ActiveLuckyBlocks = workspace:FindFirstChild("ActiveLuckyBlocks")
+
+if not M.ActiveBrainrots then
+    task.spawn(function() M.ActiveBrainrots = workspace:WaitForChild("ActiveBrainrots", 15) end)
+end
+if not M.ActiveLuckyBlocks then
+    task.spawn(function() M.ActiveLuckyBlocks = workspace:WaitForChild("ActiveLuckyBlocks", 15) end)
+end
+
+M.PlotAction = nil
+pcall(function()
+    M.PlotAction = ReplicatedStorage:WaitForChild("Shared",10):WaitForChild("Remotes",10):WaitForChild("Networking",10):WaitForChild("RF/PlotAction",10)
+end)
+if not M.PlotAction then
+    pcall(function()
+        M.PlotAction = ReplicatedStorage:WaitForChild("Packages",10):WaitForChild("Net",10):WaitForChild("RF/Plot.PlotAction",10)
+    end)
+end
+
+M.S = {
+    Farming=false, SelectedBrainrots={}, TargetMutation="None", TargetRarity={"Common"},
+    TweenSpeed=9999, CorridorSpeed=1500, AutoCollectMoney=false, InstantPickup=true,
+    AntiAFK=false, AutoUpgrade=false, MaxLevel=250, FactoryEnabled=false,
+    FactorySlot="5", FactoryRarity="Common", FactoryMutation="None", FactoryMaxLevel=250,
+    FarmMode="Collect, Place & Max", FarmSlot="5", ValentineEnabled=false,
+    ArcadeEnabled=false, MapFixerEnabled=false, LuckyBlockEnabled=false,
+    LuckyBlockRarity={"Common"}, LuckyBlockMutation="Any", GodEnabled=false,
+    GodWalkY=0, GodFloorY=-10, DoomEnabled=false, DoomTowerEnabled=false,
+    DoomTowerOffset=0, WallTheme="Auto", GuiScale=1.0,
+}
+
+M.Status = {
+    farm="Idle", farmCount=0, money="Idle", afk="Uit", placeCount=0, upgradeCount=0,
+    upgrade="Idle", factory="Idle", factoryCount=0, valentine="Idle", valentineCount=0,
+    arcade="Idle", arcadeCount=0, mapFixer="Uit", luckyBlock="Idle", luckyBlockCount=0,
+    god="Uit", doom="Uit", doomCount=0, doomTower="Uit",
+}
+
+M.baseGUID=nil M.baseCFrame=nil M.homePosition=nil M.farmThread=nil M.factoryThread=nil
+M.moneyThread=nil M.moneyRemoteThread=nil M.afkThread=nil M._afkSteppedConn=nil
+M._instantConn=nil M.upgradeThread=nil M.valentineThread=nil
+M._valentineCachedParts={} M._valentineLastCacheScan=0 M._valentineStationCF=nil
+M._candyCachedParts={} M._candyLastCacheScan=0
+M.arcadeThread=nil M.mapFixerThread=nil M.lastMapName=""
+M.luckyBlockThread=nil M._isGod=false M._godLoopThread=nil
+M._godHealthConn=nil M._godDiedConn=nil M._godOriginalFloors={}
+M._godCreatedParts={} M._godKillParts={} M._godKillWatchThread=nil M._godFloorCacheTime=0
+M._towerMoved=false M._towerOriginalCF=nil M._towerOriginalY=nil
+M._towerWatchThread=nil M._towerLastTargetY=nil
+M._towerDetectedFloorY=nil M._towerDetectedSource=nil
+M._doomConn=nil M._doomDescConn=nil M._doomTowerDescConn=nil
+M._doomCachedParts={} M._doomLastScan=0 M._doomCollected=0
+M._wallZ_front=207 M._wallZ_back=-207
+
+local HIGH_RARITIES = {["Celestial"]=true,["Divine"]=true,["Infinity"]=true}
+
+-- ============================================
+-- [MODULE 3] KLEUR THEMAS
+-- ============================================
+local WALL_THEMES = {
+    Dark      = {wall=Color3.fromRGB(20,20,30),   floor=Color3.fromRGB(15,15,20),   stripe=Color3.fromRGB(255,200,50),  glow=Color3.fromRGB(255,215,0)},
+    Doom      = {wall=Color3.fromRGB(60,10,10),   floor=Color3.fromRGB(40,5,5),     stripe=Color3.fromRGB(255,60,0),    glow=Color3.fromRGB(255,80,20)},
+    Valentine = {wall=Color3.fromRGB(80,20,40),   floor=Color3.fromRGB(60,15,30),   stripe=Color3.fromRGB(255,100,150), glow=Color3.fromRGB(255,130,180)},
+    UFO       = {wall=Color3.fromRGB(10,40,10),   floor=Color3.fromRGB(5,30,5),     stripe=Color3.fromRGB(0,255,80),    glow=Color3.fromRGB(50,255,100)},
+    Bright    = {wall=Color3.fromRGB(200,200,210), floor=Color3.fromRGB(180,180,190), stripe=Color3.fromRGB(50,50,200),  glow=Color3.fromRGB(80,80,255)},
+}
+
+local function getThemeColors()
+    local theme = M.S.WallTheme or "Dark"
+    if theme == "Auto" then
+        local mn = (M.lastMapName or ""):lower()
+        if mn:find("doom") then return WALL_THEMES.Doom
+        elseif mn:find("valentine") or mn:find("candy") then return WALL_THEMES.Valentine
+        elseif mn:find("ufo") or mn:find("radioactive") then return WALL_THEMES.UFO
+        elseif mn:find("bright") or mn:find("white") then return WALL_THEMES.Bright
+        else return WALL_THEMES.Dark end
+    end
+    return WALL_THEMES[theme] or WALL_THEMES.Dark
+end
+
+local function isMzDPart(obj)
+    if not obj or not obj:IsA("BasePart") then return false end
+    local n = obj.Name
+    if n=="MzDGodFloor" or n=="MzDGodCatchFloor" or n=="MzDGodFloorStripe" then return true end
+    local p = obj.Parent
+    while p do
+        if p.Name=="MzDHubWalls" or p.Name=="MzDGodPreview" then return true end
+        p = p.Parent
+    end
+    return false
+end
+
+local _lastPlotCall = 0
+local PLOT_COOLDOWN = 0.15
+local function throttledPlotAction(action, guid, slot)
+    local now = tick()
+    if now - _lastPlotCall < PLOT_COOLDOWN then task.wait(PLOT_COOLDOWN-(now-_lastPlotCall)) end
+    _lastPlotCall = tick()
+    if not M.PlotAction then return false end
+    if slot  then return pcall(function() M.PlotAction:InvokeServer(action,guid,slot) end)
+    elseif guid then return pcall(function() M.PlotAction:InvokeServer(action,guid) end)
+    else return pcall(function() M.PlotAction:InvokeServer(action) end) end
+end
+
+-- ============================================
+-- [MODULE 4] TOWER HELPERS
+-- ============================================
+local function findTower()
+    local ok, t = pcall(function() return workspace.GameObjects.PlaceSpecific.root.Tower end)
+    if ok and t then return t end
+    for _, c in pairs(workspace:GetDescendants()) do
+        if c.Name=="Tower" and c:IsA("Model") then
+            local cnt=0
+            for _, d in pairs(c:GetDescendants()) do if d:IsA("BasePart") then cnt+=1 end if cnt>5 then return c end end
+        end
+    end
+    return nil
+end
+
+local function getTowerBottomY()
+    local tower = findTower() if not tower then return nil end
+    local minY = math.huge
+    for _, p in pairs(tower:GetDescendants()) do
+        if p:IsA("BasePart") then local b=p.Position.Y-p.Size.Y/2 if b<minY then minY=b end end
+    end
+    return minY==math.huge and nil or minY
+end
+
+local function getTowerY()
+    local tower = findTower() if not tower then return nil end
+    local ok,piv = pcall(function() return tower:GetPivot() end)
+    if ok and piv then return piv.Position.Y end return nil
+end
+
+local function detectFloorY()
+    local floors={}
+    for _, c in pairs(workspace:GetChildren()) do
+        if c:IsA("BasePart") and c.Name=="MzDGodFloor" then
+            table.insert(floors,{y=c.Position.Y+c.Size.Y/2,source="GodFloor"})
+        end
+    end
+    local map=nil
+    for _, c in pairs(workspace:GetChildren()) do
+        if c:IsA("Model") and c.Name:find("Map") and not c.Name:find("SharedInstances") then
+            if c:FindFirstChild("Spawners") or c:FindFirstChild("FirstFloor") or c:FindFirstChild("Ground") then map=c break end
+            local cnt=0
+            for _, d in pairs(c:GetDescendants()) do if d:IsA("BasePart") then cnt+=1 end if cnt>10 then map=c break end end
+            if map then break end
+        end
+    end
+    if map then
+        for _, name in pairs({"FirstFloor","Ground","Floor","BridgeFloor"}) do
+            local f=map:FindFirstChild(name)
+            if f and f:IsA("BasePart") then table.insert(floors,{y=f.Position.Y+f.Size.Y/2,source="Map:"..name}) end
+        end
+        local sp=map:FindFirstChild("Spawners")
+        if sp then for _, s in pairs(sp:GetChildren()) do
+            if s:IsA("BasePart") and s.Size.X>15 and s.Size.Z>5 and s.Size.Y<20 and s.Position.Y>-15 and s.Position.Y<30 then
+                table.insert(floors,{y=s.Position.Y+s.Size.Y/2,source="Spawner"})
+            end
+        end end
+        for _, c2 in pairs(map:GetChildren()) do
+            if c2:IsA("BasePart") and not isMzDPart(c2) and c2.Size.X>30 and c2.Size.Z>15 and c2.Size.Y<15 and c2.Position.Y>-15 and c2.Position.Y<30 then
+                table.insert(floors,{y=c2.Position.Y+c2.Size.Y/2,source="MapPart"})
+            end
+        end
+    end
+    for _, c in pairs(workspace:GetChildren()) do
+        if c.Name:find("SharedInstances") then
+            local fl=c:FindFirstChild("Floors")
+            if fl then for _, f in pairs(fl:GetChildren()) do
+                if f:IsA("BasePart") and f.Size.X>15 and f.Size.Z>5 then
+                    table.insert(floors,{y=f.Position.Y+f.Size.Y/2,source="Shared"})
+                end
+            end end
+        end
+    end
+    local hrp=Player.Character and Player.Character:FindFirstChild("HumanoidRootPart")
+    if hrp then
+        local params=RaycastParams.new() params.FilterType=Enum.RaycastFilterType.Exclude
+        local excl={} local tw=findTower() if tw then table.insert(excl,tw) end
+        params.FilterDescendantsInstances=excl
+        local res=workspace:Raycast(hrp.Position,Vector3.new(0,-100,0),params)
+        if res then table.insert(floors,{y=res.Position.Y,source="Raycast"}) end
+    end
+    if #floors==0 then return hrp and hrp.Position.Y-3 or 0, "Default" end
+    table.sort(floors,function(a,b) return a.y>b.y end)
+    return floors[1].y, floors[1].source
+end
+
+local function moveTowerToFloor(floorTopY, offset)
+    local tower=findTower() if not tower then return false end
+    if not M._towerOriginalCF then pcall(function() M._towerOriginalCF=tower:GetPivot() end) end
+    local origPivot=M._towerOriginalCF if not origPivot then return false end
+    local currentPivot=tower:GetPivot() local currentBottom=getTowerBottomY()
+    if not currentBottom then return false end
+    local alreadyMoved=currentPivot.Position.Y-origPivot.Position.Y
+    local origBottom=currentBottom-alreadyMoved
+    local targetBottom=floorTopY+offset
+    if math.abs(currentBottom-targetBottom)<0.3 then return true end
+    pcall(function() tower:PivotTo(origPivot*CFrame.new(0,targetBottom-origBottom,0)) end)
+    pcall(function() for _, p in pairs(tower:GetDescendants()) do if p:IsA("BasePart") then p.Anchored=true end end end)
+    M._towerMoved=true M._towerLastTargetY=targetBottom M._towerDetectedFloorY=floorTopY
+    return true
+end
+
+local function restoreTower()
+    if not M._towerOriginalCF then return false end
+    local tower=findTower() if not tower then return false end
+    pcall(function() tower:PivotTo(M._towerOriginalCF) end)
+    M._towerMoved=false M._towerOriginalCF=nil M._towerLastTargetY=nil
+    return true
+end
+
+local function startTowerWatcher()
+    if M._towerWatchThread then pcall(task.cancel,M._towerWatchThread) end
+    M._towerWatchThread=task.spawn(function()
+        while M.S.DoomTowerEnabled and M._towerMoved do
+            pcall(function()
+                local tower=findTower()
+                if tower and M._towerLastTargetY then
+                    local bY=getTowerBottomY()
+                    if bY and math.abs(bY-M._towerLastTargetY)>3 then
+                        moveTowerToFloor(M._towerDetectedFloorY or detectFloorY(),M.S.DoomTowerOffset)
+                    end
+                    for _, p in pairs(tower:GetDescendants()) do if p:IsA("BasePart") then p.Anchored=true end end
+                end
+            end)
+            task.wait(3)
+        end
+    end)
+end
+
+function M.enableTowerDrop()
+    M.S.DoomTowerEnabled=true
+    local floorY,source=detectFloorY()
+    M._towerDetectedFloorY=floorY M._towerDetectedSource=source
+    local ok=moveTowerToFloor(floorY,M.S.DoomTowerOffset)
+    if ok then startTowerWatcher() M.Status.doomTower="Aan (floor:"..string.format("%.0f",floorY).." off:"..M.S.DoomTowerOffset..")"
+    else M.Status.doomTower="Tower niet gevonden" end
+    return ok
+end
+
+function M.disableTowerDrop()
+    M.S.DoomTowerEnabled=false
+    if M._towerWatchThread then pcall(task.cancel,M._towerWatchThread) M._towerWatchThread=nil end
+    restoreTower() M._towerMoved=false M.Status.doomTower="Uit"
+end
+
+-- ============================================
+-- [MODULE 5] DOOM EVENT COLLECTOR
+-- ============================================
+local function scanDoomParts()
+    M._doomCachedParts={}
+    local folder=workspace:FindFirstChild("DoomEventParts")
+    if folder then
+        for _, obj in pairs(folder:GetDescendants()) do
+            if obj:IsA("BasePart") then table.insert(M._doomCachedParts,obj) end
+            if obj:IsA("ProximityPrompt") then safeFirePrompt(obj) end
+        end
+    end
+    local tower=findTower()
+    if tower then
+        for _, obj in pairs(tower:GetDescendants()) do
+            if obj:IsA("BasePart") and obj:FindFirstChild("TouchInterest") then
+                local found=false
+                for _, c in pairs(M._doomCachedParts) do if c==obj then found=true break end end
+                if not found then table.insert(M._doomCachedParts,obj) end
+            end
+            if obj:IsA("ProximityPrompt") then safeFirePrompt(obj) end
+        end
+    end
+    M._doomLastScan=tick()
+    return #M._doomCachedParts
+end
+
+local function handleDoomNewDesc(d)
+    if not M.S.DoomEnabled then return end
+    if d:IsA("BasePart") then
+        table.insert(M._doomCachedParts,d)
+        local hrp=Player.Character and Player.Character:FindFirstChild("HumanoidRootPart")
+        safeTouchInterest(hrp,d,0) safeTouchInterest(hrp,d,1)
+    end
+    if d:IsA("ProximityPrompt") then safeFirePrompt(d) end
+end
+
+function M.startDoomCollector()
+    if M.S.DoomEnabled then return end
+    M.S.DoomEnabled=true M._doomCollected=0 M.Status.doomCount=0
+    local partCount=scanDoomParts()
+    local folder=workspace:FindFirstChild("DoomEventParts")
+    if not folder then
+        task.spawn(function()
+            folder=workspace:WaitForChild("DoomEventParts",30)
+            if folder and M.S.DoomEnabled then
+                scanDoomParts()
+                M._doomDescConn=folder.DescendantAdded:Connect(handleDoomNewDesc)
+            end
+        end)
+    else
+        if M._doomDescConn then pcall(function() M._doomDescConn:Disconnect() end) end
+        M._doomDescConn=folder.DescendantAdded:Connect(handleDoomNewDesc)
+    end
+    local tower=findTower()
+    if tower then
+        if M._doomTowerDescConn then pcall(function() M._doomTowerDescConn:Disconnect() end) end
+        M._doomTowerDescConn=tower.DescendantAdded:Connect(handleDoomNewDesc)
+    end
+    M._doomConn=RunService.Heartbeat:Connect(function()
+        if not M.S.DoomEnabled then return end
+        pcall(function()
+            local hrp=Player.Character and Player.Character:FindFirstChild("HumanoidRootPart")
+            if not hrp then return end
+            if tick()-M._doomLastScan>10 then
+                local alive={}
+                for _, p in pairs(M._doomCachedParts) do if p and p.Parent then table.insert(alive,p) end end
+                M._doomCachedParts=alive
+                local f2=workspace:FindFirstChild("DoomEventParts")
+                if f2 then
+                    for _, obj in pairs(f2:GetDescendants()) do
+                        if obj:IsA("BasePart") then
+                            local found=false
+                            for _, c in pairs(M._doomCachedParts) do if c==obj then found=true break end end
+                            if not found then table.insert(M._doomCachedParts,obj) end
+                        end
+                    end
+                end
+                local tw=findTower()
+                if tw then
+                    for _, obj in pairs(tw:GetDescendants()) do
+                        if obj:IsA("BasePart") and obj:FindFirstChild("TouchInterest") then
+                            local found=false
+                            for _, c in pairs(M._doomCachedParts) do if c==obj then found=true break end end
+                            if not found then table.insert(M._doomCachedParts,obj) end
+                        end
+                    end
+                end
+                M._doomLastScan=tick()
+            end
+            for _, p in pairs(M._doomCachedParts) do
+                if p and p.Parent then safeTouchInterest(hrp,p,0) safeTouchInterest(hrp,p,1) end
+            end
+            local f3=workspace:FindFirstChild("DoomEventParts") if f3 then fireAllPrompts(f3) end
+            local tw2=findTower() if tw2 then fireAllPrompts(tw2) end
+        end)
+    end)
+    M.Status.doom="Aan ("..partCount.." parts)"
+end
+
+function M.stopDoomCollector()
+    M.S.DoomEnabled=false
+    if M._doomConn       then pcall(function() M._doomConn:Disconnect() end)       M._doomConn=nil end
+    if M._doomDescConn   then pcall(function() M._doomDescConn:Disconnect() end)   M._doomDescConn=nil end
+    if M._doomTowerDescConn then pcall(function() M._doomTowerDescConn:Disconnect() end) M._doomTowerDescConn=nil end
+    M._doomCachedParts={} M._doomCollected=0 M.Status.doom="Uit"
+end
+
+-- ============================================
+-- [MODULE 6] GOD MODE
+-- ============================================
+local function godFindFloorParts()
+    local floors={} local map=nil
+    for _, c in pairs(workspace:GetChildren()) do
+        if c:IsA("Model") and c.Name:find("Map") and not c.Name:find("SharedInstances") and not c.Name:find("VFX") then
+            if c:FindFirstChild("Spawners") or c:FindFirstChild("FirstFloor") or c:FindFirstChild("Ground") then map=c break end
+            local hasFloor=false
+            for _, d in pairs(c:GetDescendants()) do if d:IsA("BasePart") then local n=d.Name:lower() if n=="firstfloor" or n=="ground" or n=="floor" then hasFloor=true break end end end
+            if hasFloor then map=c break end
+        end
+    end
+    if not map then
+        for _, c in pairs(workspace:GetChildren()) do
+            if c:IsA("Model") and c.Name:find("Map") and not c.Name:find("SharedInstances") and not c.Name:find("VFX") then
+                local cnt=0
+                for _, d in pairs(c:GetDescendants()) do if d:IsA("BasePart") then cnt+=1 end if cnt>10 then map=c break end end
+                if map then break end
+            end
+        end
+    end
+    if map then
+        local seen={}
+        for _, d in pairs(map:GetDescendants()) do
+            if d:IsA("BasePart") and not isMzDPart(d) and not seen[d] then
+                local n=d.Name:lower()
+                if n=="firstfloor" or n=="ground" or n=="floor" or n=="grass" or n=="path" or n=="road" or n=="platform" or n=="bridgefloor" then
+                    seen[d]=true table.insert(floors,d)
+                elseif d.Size.X>15 and d.Size.Z>5 and d.Size.Y<20 and d.Position.Y>-10 and d.Position.Y<30 then
+                    seen[d]=true table.insert(floors,d)
+                end
+            end
+        end
+        local sp=map:FindFirstChild("Spawners")
+        if sp then for _, s in pairs(sp:GetChildren()) do
+            if s:IsA("BasePart") and not seen[s] and not isMzDPart(s) and s.Size.X>15 and s.Size.Z>5 and s.Size.Y<20 and s.Position.Y>-10 and s.Position.Y<30 then
+                seen[s]=true table.insert(floors,s)
+            end
+        end end
+    end
+    for _, c in pairs(workspace:GetChildren()) do
+        if c.Name:find("SharedInstances") then
+            local fl=c:FindFirstChild("Floors")
+            if fl then for _, f in pairs(fl:GetChildren()) do
+                if f:IsA("BasePart") and not isMzDPart(f) and f.Size.X>15 and f.Size.Z>5 and f.Size.Y<20 and f.Position.Y>-10 and f.Position.Y<30 then
+                    table.insert(floors,f)
+                end
+            end end
+            for _, f in pairs(c:GetChildren()) do
+                if f:IsA("BasePart") and not isMzDPart(f) and f.Size.X>15 and f.Size.Z>5 and f.Size.Y<20 and f.Position.Y>-10 and f.Position.Y<30 then
+                    table.insert(floors,f)
+                end
+            end
+        end
+    end
+    return floors,map
+end
+
+local function godDetectMapXRange(map)
+    local minX,maxX=math.huge,-math.huge local found=false
+    local function chk(p)
+        if not p:IsA("BasePart") or isMzDPart(p) then return end
+        if p.Size.Y>p.Size.X and p.Size.Y>p.Size.Z then return end
+        if p.Position.Y>50 or p.Position.Y<-30 or p.Size.X<5 then return end
+        local l=p.Position.X-p.Size.X/2 local r=p.Position.X+p.Size.X/2
+        if l<minX then minX=l end if r>maxX then maxX=r end found=true
+    end
+    if map then for _, d in pairs(map:GetDescendants()) do if d:IsA("BasePart") then chk(d) end end end
+    for _, c in pairs(workspace:GetChildren()) do
+        if c.Name:find("SharedInstances") then
+            for _, f in pairs(c:GetChildren()) do if f:IsA("BasePart") then chk(f) end end
+            local fl=c:FindFirstChild("Floors") if fl then for _, f in pairs(fl:GetChildren()) do chk(f) end end
+        end
+    end
+    if found and maxX>minX then return minX-20,maxX+20 end
+    return -50,4500
+end
+
+local function godFindAllKillParts()
+    local kills,seen={},{}
+    for _, c in pairs(workspace:GetDescendants()) do
+        if c:IsA("BasePart") and not seen[c] and not isMzDPart(c) then
+            local ok2,isKill=pcall(function() return c.Size.Y<1 and c.Size.Z>50 and c.Position.Y<5 and c.Position.Y>-5 and c.Size.X<5 end)
+            if ok2 and isKill then seen[c]=true table.insert(kills,c) end
+            if not seen[c] then
+                local n=c.Name:lower()
+                if n:find("kill") or n:find("tsunamikill") or n:find("deathzone") or n:find("damagezone") or n:find("killbrick") or n:find("killpart") then
+                    seen[c]=true table.insert(kills,c)
+                end
+            end
+        end
+    end
+    return kills
+end
+
+local function godDisableKillParts()
+    M._godKillParts={}
+    for _, p in pairs(godFindAllKillParts()) do
+        table.insert(M._godKillParts,{part=p,canCollide=p.CanCollide,canTouch=p.CanTouch,size=p.Size,position=p.Position,transparency=p.Transparency})
+        pcall(function() p.CanCollide=false p.CanTouch=false p.Transparency=1 p.Size=Vector3.new(0,0,0) p.Position=Vector3.new(0,-9999,0) end)
+    end
+    return #M._godKillParts
+end
+
+local function godRestoreKillParts()
+    for _, data in pairs(M._godKillParts) do
+        pcall(function()
+            if data.part and data.part.Parent then
+                data.part.Size=data.size data.part.Position=data.position
+                data.part.CanCollide=data.canCollide data.part.CanTouch=data.canTouch data.part.Transparency=data.transparency
+            end
+        end)
+    end
+    M._godKillParts={}
+end
+
+local function godStartKillWatcher()
+    if M._godKillWatchThread then pcall(task.cancel,M._godKillWatchThread) end
+    M._godKillWatchThread=task.spawn(function()
+        while M._isGod do
+            pcall(function()
+                for _, data in pairs(M._godKillParts) do
+                    if data.part and data.part.Parent then
+                        data.part.CanCollide=false data.part.CanTouch=false
+                        data.part.Size=Vector3.new(0,0,0) data.part.Position=Vector3.new(0,-9999,0)
+                    end
+                end
+                for _, c in pairs(workspace:GetDescendants()) do
+                    if c:IsA("BasePart") and not isMzDPart(c) then
+                        local isKill=false
+                        pcall(function() if c.Size.Y<1 and c.Size.Z>50 and c.Position.Y<5 and c.Position.Y>-5 and c.Size.X<5 then isKill=true end end)
+                        if not isKill then local n=c.Name:lower() if n:find("kill") or n:find("deathzone") or n:find("damagezone") then isKill=true end end
+                        if isKill then
+                            local already=false
+                            for _, data in pairs(M._godKillParts) do if data.part==c then already=true break end end
+                            if not already then
+                                table.insert(M._godKillParts,{part=c,canCollide=c.CanCollide,canTouch=c.CanTouch,size=c.Size,position=c.Position,transparency=c.Transparency})
+                                pcall(function() c.CanCollide=false c.CanTouch=false c.Transparency=1 c.Size=Vector3.new(0,0,0) c.Position=Vector3.new(0,-9999,0) end)
+                            end
+                        end
+                    end
+                end
+            end)
+            task.wait(3)
+        end
+    end)
+end
+
+local function godBuildEgaleVloer(map)
+    for _, p in pairs(M._godCreatedParts) do pcall(function() if p and p.Parent then p:Destroy() end end) end
+    M._godCreatedParts={}
+    local startX,endX=godDetectMapXRange(map)
+    local floorY,floorW,floorT=M.S.GodFloorY,420,4
+    local theme=getThemeColors() local maxSeg,curX=2000,startX local first=true
+    while curX<endX do
+        local segLen=math.min(maxSeg,endX-curX) local cx=curX+segLen/2
+        local floor=Instance.new("Part") floor.Name="MzDGodFloor" floor.Size=Vector3.new(segLen,floorT,floorW)
+        floor.Position=Vector3.new(cx,floorY,0) floor.Anchored=true floor.CanCollide=true
+        floor.Color=theme.floor floor.Material=Enum.Material.SmoothPlastic
+        floor.TopSurface=Enum.SurfaceType.Smooth floor.BottomSurface=Enum.SurfaceType.Smooth floor.Parent=workspace
+        table.insert(M._godCreatedParts,floor)
+        if first then first=false
+            pcall(function()
+                local sg=Instance.new("SurfaceGui") sg.Face=Enum.NormalId.Top sg.CanvasSize=Vector2.new(2400,800) sg.Parent=floor
+                local t1=Instance.new("TextLabel") t1.Size=UDim2.new(1,0,0.6,0) t1.Position=UDim2.new(0,0,0.05,0)
+                t1.BackgroundTransparency=1 t1.Text="MzD Hub" t1.TextColor3=theme.glow t1.TextScaled=true t1.Font=Enum.Font.GothamBold t1.Parent=sg
+                local t2=Instance.new("TextLabel") t2.Size=UDim2.new(0.4,0,0.2,0) t2.Position=UDim2.new(0.3,0,0.7,0)
+                t2.BackgroundTransparency=1 t2.Text="v13.0" t2.TextColor3=theme.stripe t2.TextScaled=true t2.Font=Enum.Font.Gotham t2.Parent=sg
+            end)
+        end
+        local topY=floorY+floorT/2+0.1
+        for _, zPos in pairs({floorW/2-5,-floorW/2+5}) do
+            local s=Instance.new("Part") s.Name="MzDGodFloorStripe" s.Size=Vector3.new(segLen,0.2,2)
+            s.Position=Vector3.new(cx,topY,zPos) s.Anchored=true s.CanCollide=false s.Color=theme.stripe s.Material=Enum.Material.Neon s.Parent=workspace
+            table.insert(M._godCreatedParts,s)
+        end
+        local sm=Instance.new("Part") sm.Name="MzDGodFloorStripe" sm.Size=Vector3.new(segLen,0.2,1)
+        sm.Position=Vector3.new(cx,topY,0) sm.Anchored=true sm.CanCollide=false sm.Color=theme.stripe sm.Material=Enum.Material.Neon sm.Parent=workspace
+        table.insert(M._godCreatedParts,sm)
+        curX=curX+segLen
+    end
+    local catch=Instance.new("Part") catch.Name="MzDGodCatchFloor"
+    catch.Size=Vector3.new(math.abs(endX-startX)+200,2,floorW+100)
+    catch.Position=Vector3.new((startX+endX)/2,floorY-15,0) catch.Anchored=true catch.CanCollide=true catch.Transparency=1 catch.Parent=workspace
+    table.insert(M._godCreatedParts,catch)
+    return true
+end
+
+local function godHideOriginalFloors()
+    local floors,map=godFindFloorParts() M._godOriginalFloors={}
+    for _, p in pairs(floors) do
+        table.insert(M._godOriginalFloors,{part=p,size=p.Size,position=p.Position,canCollide=p.CanCollide,transparency=p.Transparency,color=p.Color,material=p.Material,anchored=p.Anchored})
+        pcall(function() p.CanCollide=false p.Transparency=1 end)
+    end
+    if map then
+        for _, c in pairs(map:GetChildren()) do
+            if c:IsA("BasePart") and c.Name=="BridgeFloor" and not isMzDPart(c) then
+                table.insert(M._godOriginalFloors,{part=c,size=c.Size,position=c.Position,canCollide=c.CanCollide,transparency=c.Transparency,color=c.Color,material=c.Material,anchored=c.Anchored})
+                pcall(function() c.CanCollide=false c.Transparency=1 end)
+            end
+        end
+    end
+    return map
+end
+
+local function godRestoreFloors()
+    for _, data in pairs(M._godOriginalFloors) do
+        pcall(function()
+            if data.part and data.part.Parent then
+                data.part.Size=data.size data.part.Position=data.position data.part.CanCollide=data.canCollide
+                data.part.Transparency=data.transparency data.part.Color=data.color data.part.Material=data.material data.part.Anchored=data.anchored
+            end
+        end)
+    end
+    M._godOriginalFloors={}
+    for _, f in pairs(M._godCreatedParts) do pcall(function() if f and f.Parent then f:Destroy() end end) end
+    M._godCreatedParts={}
+end
+
+local function godTeleportUnder()
+    local hrp=Player.Character and Player.Character:FindFirstChild("HumanoidRootPart") if not hrp then return end
+    local hum=Player.Character:FindFirstChild("Humanoid")
+    hrp.Velocity=Vector3.new(0,0,0) hrp.CFrame=CFrame.new(hrp.Position.X,M.S.GodWalkY,hrp.Position.Z)
+    if hum then pcall(function()
+        hum:SetStateEnabled(Enum.HumanoidStateType.FallingDown,false)
+        hum:SetStateEnabled(Enum.HumanoidStateType.Ragdoll,false)
+        hum:SetStateEnabled(Enum.HumanoidStateType.Tripping,false)
+        hum:ChangeState(Enum.HumanoidStateType.Running) hum.HipHeight=0
+    end) end
+end
+
+local function godStartLoop()
+    if M._godLoopThread then pcall(task.cancel,M._godLoopThread) end
+    M._godLoopThread=task.spawn(function()
+        while M._isGod do
+            pcall(function()
+                local ch=Player.Character if not ch then return end
+                local hrp=ch:FindFirstChild("HumanoidRootPart") local hum=ch:FindFirstChild("Humanoid")
+                if tick()-M._godFloorCacheTime>5 then
+                    for _, data in pairs(M._godOriginalFloors) do
+                        if data.part and data.part.Parent then data.part.CanCollide=false data.part.Transparency=1 end
+                    end
+                    M._godFloorCacheTime=tick()
+                end
+                if hum then pcall(function()
+                    hum:SetStateEnabled(Enum.HumanoidStateType.FallingDown,false)
+                    hum:SetStateEnabled(Enum.HumanoidStateType.Ragdoll,false)
+                    hum:SetStateEnabled(Enum.HumanoidStateType.Tripping,false)
+                    local state=hum:GetState()
+                    if state==Enum.HumanoidStateType.FallingDown or state==Enum.HumanoidStateType.Ragdoll or state==Enum.HumanoidStateType.Tripping then
+                        hum:ChangeState(Enum.HumanoidStateType.Running)
+                    end
+                end) end
+                if hrp and hrp.Position.Y<M.S.GodWalkY-30 then
+                    hrp.Velocity=Vector3.new(0,0,0) hrp.CFrame=CFrame.new(hrp.Position.X,M.S.GodWalkY,hrp.Position.Z)
+                end
+            end)
+            task.wait(0.5)
+        end
+    end)
+end
+
+local function godSetupHealth(char)
+    if M._godHealthConn then pcall(function() M._godHealthConn:Disconnect() end) end
+    if M._godDiedConn   then pcall(function() M._godDiedConn:Disconnect() end) end
+    local hum=char:WaitForChild("Humanoid",5) if not hum then return end
+    pcall(function()
+        hum.MaxHealth=math.huge hum.Health=math.huge
+        hum:SetStateEnabled(Enum.HumanoidStateType.Dead,false)
+        hum:SetStateEnabled(Enum.HumanoidStateType.FallingDown,false)
+        hum:SetStateEnabled(Enum.HumanoidStateType.Ragdoll,false)
+        hum:SetStateEnabled(Enum.HumanoidStateType.Tripping,false)
+        hum.HipHeight=0
+    end)
+    for _, ff in pairs(char:GetChildren()) do if ff:IsA("ForceField") then ff:Destroy() end end
+    local ff=Instance.new("ForceField") ff.Visible=false ff.Parent=char
+    M._godHealthConn=hum:GetPropertyChangedSignal("Health"):Connect(function()
+        if not M._isGod then return end
+        pcall(function() if hum.Health~=math.huge then hum.Health=math.huge end end)
+    end)
+    M._godDiedConn=hum.Died:Connect(function()
+        if not M._isGod then return end
+        task.defer(function() pcall(function()
+            hum:SetStateEnabled(Enum.HumanoidStateType.Dead,false)
+            hum:ChangeState(Enum.HumanoidStateType.GettingUp)
+            hum.MaxHealth=math.huge hum.Health=math.huge
+        end) end)
+    end)
+end
+
+function M.enableGod()
+    if M._isGod then return end
+    M._isGod=true M.S.GodEnabled=true M._godFloorCacheTime=0
+    local killCount=godDisableKillParts() godStartKillWatcher() task.wait(0.1)
+    local map=godHideOriginalFloors() task.wait(0.1)
+    godBuildEgaleVloer(map) task.wait(0.2)
+    godStartLoop() task.wait(0.1)
+    godTeleportUnder() task.wait(0.1)
+    if Player.Character then godSetupHealth(Player.Character) end
+    local towerStatus=""
+    if M.S.DoomTowerEnabled then towerStatus=M.enableTowerDrop() and " | Tower Y" or " | Tower X" end
+    M.Status.god="Aan (Y="..M.S.GodWalkY.." K:"..killCount.." V:"..#M._godCreatedParts..towerStatus..")"
+end
+
+function M.disableGod()
+    M._isGod=false M.S.GodEnabled=false
+    if M._godLoopThread      then pcall(task.cancel,M._godLoopThread)      M._godLoopThread=nil end
+    if M._godKillWatchThread then pcall(task.cancel,M._godKillWatchThread) M._godKillWatchThread=nil end
+    if M._godHealthConn then pcall(function() M._godHealthConn:Disconnect() end) M._godHealthConn=nil end
+    if M._godDiedConn   then pcall(function() M._godDiedConn:Disconnect() end)   M._godDiedConn=nil end
+    godRestoreFloors() godRestoreKillParts()
+    local hrp=Player.Character and Player.Character:FindFirstChild("HumanoidRootPart")
+    if hrp then hrp.Velocity=Vector3.new(0,0,0) hrp.CFrame=CFrame.new(hrp.Position.X,10,hrp.Position.Z) end
+    local ch=Player.Character
+    if ch then
+        for _, ff2 in pairs(ch:GetChildren()) do if ff2:IsA("ForceField") then ff2:Destroy() end end
+        local hum=ch:FindFirstChild("Humanoid")
+        if hum then pcall(function() hum.MaxHealth=100 hum.Health=100 hum:SetStateEnabled(Enum.HumanoidStateType.Dead,true) end) end
+    end
+    M.Status.god="Uit"
+end
+
+-- ============================================
+-- [MODULE 7] EQUIP / BEWEGING / NAVIGATION
+-- ============================================
+function M.safeEquip(tool)
+    if not tool then return end
+    local ch=Player.Character if not ch then return end
+    local hum=ch:FindFirstChild("Humanoid") if not hum then return end
+    pcall(function() hum:EquipTool(tool) end) task.wait(0.4)
+end
+
+function M.safeUnequip()
+    local ch=Player.Character if not ch then return end
+    local hum=ch:FindFirstChild("Humanoid") if not hum then return end
+    pcall(function() hum:UnequipTools() end) task.wait(0.2)
+end
+
+Player.CharacterAdded:Connect(function(character)
+    task.wait(1.5)
+    if M.S.InstantPickup then M.setupInstant() end
+    task.wait(0.5) M.detectWallZ()
+    if M._isGod then
+        if M._godHealthConn then pcall(function() M._godHealthConn:Disconnect() end) M._godHealthConn=nil end
+        if M._godDiedConn   then pcall(function() M._godDiedConn:Disconnect() end)   M._godDiedConn=nil end
+        task.wait(0.5) godSetupHealth(character) godDisableKillParts()
+        pcall(function()
+            for _, data in pairs(M._godOriginalFloors) do
+                if data.part and data.part.Parent then data.part.CanCollide=false data.part.Transparency=1 end
+            end
+        end)
+        task.wait(0.3) godTeleportUnder()
+        if M.S.DoomTowerEnabled and M._towerDetectedFloorY then
+            task.wait(0.5) moveTowerToFloor(M._towerDetectedFloorY,M.S.DoomTowerOffset)
+        end
+    end
+end)
+
+function M.tweenTo(cf)
+    local ch=Player.Character if not ch then return false end
+    local hrp=ch:FindFirstChild("HumanoidRootPart") if not hrp then return false end
+    local targetCF=M._isGod and CFrame.new(cf.Position.X,M.S.GodWalkY,cf.Position.Z) or cf
+    local d=(hrp.Position-targetCF.Position).Magnitude
+    local tw=TweenService:Create(hrp,TweenInfo.new(math.max(d/M.S.TweenSpeed,0.01),Enum.EasingStyle.Linear),{CFrame=targetCF})
+    tw:Play() tw.Completed:Wait() return true
+end
+
+function M.fastTween(cf)
+    local ch=Player.Character if not ch then return false end
+    local hrp=ch:FindFirstChild("HumanoidRootPart") if not hrp then return false end
+    local targetCF=M._isGod and CFrame.new(cf.Position.X,M.S.GodWalkY,cf.Position.Z) or cf
+    local d=(hrp.Position-targetCF.Position).Magnitude
+    local tw=TweenService:Create(hrp,TweenInfo.new(math.max(d/99999,0.005),Enum.EasingStyle.Linear),{CFrame=targetCF})
+    tw:Play() tw.Completed:Wait() return true
+end
+
+function M.corridorTween(cf)
+    local ch=Player.Character if not ch then return false end
+    local hrp=ch:FindFirstChild("HumanoidRootPart") if not hrp then return false end
+    local targetCF=M._isGod and CFrame.new(cf.Position.X,M.S.GodWalkY,cf.Position.Z) or cf
+    local d=(hrp.Position-targetCF.Position).Magnitude
+    local tw=TweenService:Create(hrp,TweenInfo.new(math.max(d/math.max(M.S.CorridorSpeed or 1500,50),0.01),Enum.EasingStyle.Linear),{CFrame=targetCF})
+    tw:Play() tw.Completed:Wait() return true
+end
+
+function M.safePathTo(targetCFrame)
+    local ch=Player.Character if not ch then return false end
+    local hrp=ch:FindFirstChild("HumanoidRootPart") if not hrp then return false end
+    local sp=hrp.Position local ep=targetCFrame.Position
+    local SAFE_Z=M.getCorridorZ()
+    local SAFE_Y=M._isGod and M.S.GodWalkY or (M.getHomePosition().Position.Y+8)
+    M.fastTween(CFrame.new(sp.X,SAFE_Y,sp.Z))     task.wait(0.05)
+    M.corridorTween(CFrame.new(sp.X,SAFE_Y,SAFE_Z)) task.wait(0.05)
+    M.corridorTween(CFrame.new(ep.X,SAFE_Y,SAFE_Z)) task.wait(0.05)
+    M.corridorTween(CFrame.new(ep.X,SAFE_Y,ep.Z))   task.wait(0.05)
+    M.tweenTo(M._isGod and CFrame.new(ep.X,M.S.GodWalkY,ep.Z) or targetCFrame)
+    task.wait(0.05) return true
+end
+
+function M.safeReturnToBase()
+    local ch=Player.Character if not ch then return end
+    local hrp=ch:FindFirstChild("HumanoidRootPart") if not hrp then return end
+    local cp=hrp.Position local hp=M.getHomePosition().Position
+    M.detectWallZ()
+    local SAFE_Z=M.getCorridorZ()
+    local SAFE_Y=M._isGod and M.S.GodWalkY or (hp.Y+8)
+    M.fastTween(CFrame.new(cp.X,SAFE_Y,cp.Z))   task.wait(0.05)
+    M.corridorTween(CFrame.new(cp.X,SAFE_Y,SAFE_Z)) task.wait(0.05)
+    M.corridorTween(CFrame.new(hp.X,SAFE_Y,SAFE_Z)) task.wait(0.05)
+    M.corridorTween(CFrame.new(hp.X,SAFE_Y,hp.Z))   task.wait(0.05)
+    M.tweenTo(CFrame.new(hp.X,M._isGod and M.S.GodWalkY or hp.Y,hp.Z)) task.wait(0.05)
+end
+
+function M.returnToBase()
+    if M._isGod then local hp=M.getHomePosition().Position M.tweenTo(CFrame.new(hp.X,M.S.GodWalkY,hp.Z))
+    else M.tweenTo(M.getHomePosition()) end
+    task.wait(0.1)
+end
+
+-- ============================================
+-- [MODULE 8] MAP HELPERS / BASE
+-- ============================================
+function M.mapFindCurrentMap()
+    local best,bc=nil,0
+    for _, c in pairs(workspace:GetChildren()) do
+        if c:IsA("Model") and c.Name:find("Map") and not c.Name:find("SharedInstances") then
+            if c:FindFirstChild("Spawners") or c:FindFirstChild("Gaps") or c:FindFirstChild("FirstFloor") or c:FindFirstChild("Ground") then return c end
+            local cnt=0
+            for _, d in pairs(c:GetDescendants()) do if d:IsA("BasePart") then cnt+=1 end if cnt>10 then return c end end
+            if cnt>bc then bc=cnt best=c end
+        end
+    end
+    return best
+end
+
+function M.detectWallZ()
+    local map=M.mapFindCurrentMap() if not map then return end
+    local mzwalls=map:FindFirstChild("MzDHubWalls") if not mzwalls then return end
+    local fw=mzwalls:FindFirstChild("FrontWall_1") local bw=mzwalls:FindFirstChild("BackWall_1")
+    if fw then M._wallZ_front=fw.Position.Z-fw.Size.Z/2-3 end
+    if bw then M._wallZ_back=bw.Position.Z+bw.Size.Z/2+3 end
+end
+
+function M.getCorridorZ()
+    M.detectWallZ()
+    return M.getHomePosition().Position.Z>=0 and M._wallZ_front or M._wallZ_back
+end
+
+function M.findBase()
+    local bases=workspace:FindFirstChild("Bases") if not bases then return end
+    for _, base in pairs(bases:GetChildren()) do
+        pcall(function()
+            local pn=base.Title.TitleGui.Frame.PlayerName
+            if pn.Text==Player.Name or pn.Text==Player.DisplayName then
+                M.baseGUID=base.Name
+                local s1=base:FindFirstChild("slot 1 brainrot")
+                if s1 and s1:FindFirstChild("Root") then M.baseCFrame=s1.Root.CFrame end
+            end
+        end)
+    end
+    if not M.homePosition then M.setHomePosition() end
+end
+
+function M.setHomePosition()
+    local ch=Player.Character if not ch then return end
+    local hrp=ch:FindFirstChild("HumanoidRootPart") if not hrp then return end
+    M.homePosition=hrp.CFrame
+end
+
+function M.getHomePosition()
+    if M.homePosition then return M.homePosition end
+    if M.baseCFrame   then return M.baseCFrame end
+    return CFrame.new(124,3.8,22)
+end
+
+function M.getSlotCount()
+    if not M.baseGUID then M.findBase() end if not M.baseGUID then return 40 end
+    local bases=workspace:FindFirstChild("Bases") if not bases then return 40 end
+    local myBase=bases:FindFirstChild(M.baseGUID) if not myBase then return 40 end
+    local sf=myBase:FindFirstChild("Slots")
+    if sf then local cnt=0 for _ in pairs(sf:GetChildren()) do cnt+=1 end if cnt>0 then return cnt end end
+    local maxSlot=0
+    for _, child in pairs(myBase:GetChildren()) do
+        local s=child.Name:match("^slot (%d+) brainrot$")
+        if s then local n=tonumber(s) if n and n>maxSlot then maxSlot=n end end
+    end
+    return maxSlot>0 and maxSlot or 40
+end
+
+task.spawn(function() task.wait(3) M.findBase() end)
+
+-- ============================================
+-- [MODULE 9] ALGEMENE HELPERS & RARITY
+-- ============================================
+function M.isHighRarity(r)        return HIGH_RARITIES[r]==true end
+function M.isHighRarityTool(tool) if not tool then return false end return HIGH_RARITIES[tool:GetAttribute("Rarity") or ""]==true end
+function M.isDead()               local ch=Player.Character if not ch then return true end local hum=ch:FindFirstChild("Humanoid") if not hum then return true end return hum.Health<=0 end
+function M.waitForRespawn()       if not M.isDead() then return true end local t=tick()+15 while M.isDead() and tick()<t do task.wait(0.2) end task.wait(1) return not M.isDead() end
+
+function M.forceGrabPrompt(target)
+    if not target then return end
+    local prompts={}
+    if target:IsA("ProximityPrompt") then table.insert(prompts,target)
+    else for _, d in pairs(target:GetDescendants()) do if d:IsA("ProximityPrompt") then table.insert(prompts,d) end end end
+    for _, p in pairs(prompts) do safeFirePrompt(p) task.wait(0.02) safeFirePrompt(p) end
+    local hrp=Player.Character and Player.Character:FindFirstChild("HumanoidRootPart")
+    if hrp then
+        local parent=target if parent:IsA("ProximityPrompt") then parent=parent.Parent end
+        if parent and parent:IsA("BasePart") then safeTouchInterest(hrp,parent,0) safeTouchInterest(hrp,parent,1) end
+    end
+    task.wait(0.02)
+end
+
+function M.findBrainrotRoot(b)
+    local root=b:FindFirstChild("Root") if root and root:IsA("BasePart") then return root end
+    local rendered=b:FindFirstChild("RenderedBrainrot")
+    if rendered then local rr=rendered:FindFirstChild("Root") if rr and rr:IsA("BasePart") then return rr end end
+    for _, desc in pairs(b:GetDescendants()) do if desc:IsA("BasePart") then return desc end end
+    if b:IsA("BasePart") then return b end
+    return nil
+end
+
+function M.getTargetRarities()  return type(M.S.TargetRarity)=="table" and M.S.TargetRarity or {M.S.TargetRarity} end
+function M.rarityMatches(fn)    for _, r in pairs(M.getTargetRarities()) do if r=="Any" or r==fn then return true end end return false end
+
+function M.getBrainrotNames(rarity)
+    local names,seen={},{}
+    if not M.ActiveBrainrots then M.ActiveBrainrots=workspace:FindFirstChild("ActiveBrainrots") end
+    if not M.ActiveBrainrots then return names end
+    for _, f in pairs(M.ActiveBrainrots:GetChildren()) do
+        if f:IsA("Folder") and (rarity=="Any" or f.Name==rarity) then
+            for _, b in pairs(f:GetChildren()) do
+                local n=nil
+                if b:FindFirstChild("RenderedBrainrot") then n=b.RenderedBrainrot:GetAttribute("BrainrotName")
+                elseif b.Name=="RenderedBrainrot" then n=b:GetAttribute("BrainrotName")
+                else n=b:GetAttribute("BrainrotName") or b.Name end
+                if n and n~="" and not seen[n] then seen[n]=true table.insert(names,n) end
+            end
+        end
+    end
+    table.sort(names) return names
+end
+
+function M.getBrainrotNamesMulti(rarities)
+    if type(rarities)~="table" then return M.getBrainrotNames(rarities) end
+    local names,seen={},{}
+    for _, r in pairs(rarities) do if r=="Any" then return M.getBrainrotNames("Any") end end
+    for _, r in pairs(rarities) do for _, n in pairs(M.getBrainrotNames(r)) do if not seen[n] then seen[n]=true table.insert(names,n) end end end
+    table.sort(names) return names
+end
+
+function M.matchesFilter(b,folderRarity)
+    if not M.rarityMatches(folderRarity) then return false end
+    if M.isHighRarity(folderRarity) then return true end
+    local mut=b:GetAttribute("Mutation") or "None" local isNone=(mut:lower()=="none" or mut=="")
+    if M.S.TargetMutation=="None" then if not isNone then return false end
+    elseif M.S.TargetMutation~="Any" then if mut~=M.S.TargetMutation then return false end end
+    if #M.S.SelectedBrainrots>0 then
+        local bName=b:GetAttribute("BrainrotName") or "" local found=false
+        for _, sel in pairs(M.S.SelectedBrainrots) do if sel==bName then found=true break end end
+        if not found then return false end
+    end
+    return true
+end
+
+function M.toolMatchesRarity(tool,targetRarity,targetMutation)
+    local tMut=tool:GetAttribute("Mutation") or "None" local lvl=tonumber(tool:GetAttribute("Level")) or 0
+    local bName=tool:GetAttribute("BrainrotName") local toolRarity=tool:GetAttribute("Rarity")
+    if not bName or bName=="" then return false end
+    if lvl>=M.S.MaxLevel then return false end
+    if toolRarity and M.isHighRarity(toolRarity) then
+        local tR=type(targetRarity)=="table" and targetRarity or {targetRarity}
+        for _, r in pairs(tR) do if r=="Any" or r==toolRarity then return true end end return false
+    end
+    if targetMutation=="None" then if not (tMut:lower()=="none" or tMut=="") then return false end
+    elseif targetMutation~="Any" then if tMut~=targetMutation then return false end end
+    local tR=type(targetRarity)=="table" and targetRarity or {targetRarity}
+    local isAny=false for _, r in pairs(tR) do if r=="Any" then isAny=true break end end
+    if not isAny then
+        if toolRarity and toolRarity~="" then
+            local m2=false for _, r in pairs(tR) do if toolRarity==r then m2=true break end end if not m2 then return false end
+        else
+            local wl={} for _, r in pairs(tR) do for _, n2 in pairs(M.getBrainrotNames(r)) do wl[n2]=true end end
+            if not wl[bName] then return false end
+        end
+    end
+    return true
+end
+
+function M.getAvailableMutations()
+    local muts={"Any","None"} local seen={["Any"]=true,["None"]=true}
+    pcall(function()
+        local mf=ReplicatedStorage:FindFirstChild("Assets")
+        if mf then mf=mf:FindFirstChild("Mutations") if mf then for _, m in pairs(mf:GetChildren()) do if not seen[m.Name] then seen[m.Name]=true table.insert(muts,m.Name) end end end end
+    end)
+    for _, m in pairs({"Emerald","Gold","Blood","Diamond","Rainbow","Shadow","Crystal","Void","Doom"}) do
+        if not seen[m] then seen[m]=true table.insert(muts,m) end
+    end
+    return muts
+end
+
+function M.getAvailableRarities()
+    local rars,seen={},{}
+    for _, r in pairs({"Any","Common","Uncommon","Rare","Epic","Legendary","Mythical","Cosmic","Secret","Celestial","Divine","Infinity"}) do
+        if not seen[r] then seen[r]=true table.insert(rars,r) end
+    end
+    pcall(function()
+        if M.ActiveBrainrots then for _, f in pairs(M.ActiveBrainrots:GetChildren()) do
+            if f:IsA("Folder") and not seen[f.Name] then seen[f.Name]=true table.insert(rars,f.Name) end
+        end end
+    end)
+    return rars
+end
+
+-- ============================================
+-- [MODULE 10] SLOTS / REMOTES
+-- ============================================
+function M.isSlotEmpty(s)
+    if not M.baseGUID then M.findBase() end if not M.baseGUID then return true end
+    local mb=workspace:FindFirstChild("Bases") and workspace.Bases:FindFirstChild(M.baseGUID) if not mb then return true end
+    local sm2=mb:FindFirstChild("slot "..s.." brainrot") if not sm2 then return true end
+    local bn=sm2:GetAttribute("BrainrotName") return not bn or bn==""
+end
+
+function M.findOccupiedSlots()
+    if not M.baseGUID then M.findBase() end if not M.baseGUID then return {} end
+    local mb=workspace:FindFirstChild("Bases") and workspace.Bases:FindFirstChild(M.baseGUID) if not mb then return {} end
+    local o={}
+    for i=1,M.getSlotCount() do
+        local sm2=mb:FindFirstChild("slot "..i.." brainrot")
+        if sm2 then local bn=sm2:GetAttribute("BrainrotName") local lv=sm2:GetAttribute("Level") if bn and bn~="" then table.insert(o,{slot=i,name=bn,level=lv or 1}) end end
+    end
+    return o
+end
+
+function M.placeBrainrot(s)   if not M.baseGUID then return false end local ok=throttledPlotAction("Place Brainrot",M.baseGUID,tostring(s)) if ok then M.Status.placeCount+=1 end return ok end
+function M.pickUpBrainrot(s)  if not M.baseGUID then return false end return throttledPlotAction("Pick Up Brainrot",M.baseGUID,tostring(s)) end
+function M.upgradeBrainrot(s) if not M.baseGUID then return false end return throttledPlotAction("Upgrade Brainrot",M.baseGUID,tostring(s)) end
+function M.clearSlot(s)       if not M.baseGUID then return end throttledPlotAction("Pick Up Brainrot",M.baseGUID,tostring(s)) task.wait(0.5) M.safeUnequip() task.wait(0.3) end
+
+function M.tweenToSlot(sn)
+    if not M.baseGUID then M.findBase() end if not M.baseGUID then return false end
+    local mb=workspace:FindFirstChild("Bases") and workspace.Bases:FindFirstChild(M.baseGUID) if not mb then return false end
+    local sm2=mb:FindFirstChild("slot "..sn.." brainrot") if not sm2 then return false end
+    local root=sm2:FindFirstChild("Root")
+    if root and root:IsA("BasePart") then return M.tweenTo(root.CFrame*CFrame.new(0,3,0)) end
+    local ok2,pos=pcall(function() return sm2:GetPivot() end)
+    if ok2 and pos then return M.tweenTo(pos*CFrame.new(0,3,0)) end
+    return false
+end
+
+function M.upgradeSlotToMax(slot)
+    if not M.baseGUID then M.findBase() end if not M.baseGUID then return end
+    local mb=workspace:FindFirstChild("Bases") and workspace.Bases:FindFirstChild(M.baseGUID) if not mb then return end
+    local sm2=mb:FindFirstChild("slot "..slot.." brainrot") if not sm2 then return end
+    if M.isHighRarity(sm2:GetAttribute("Rarity") or "") then return end
+    local cur=tonumber(sm2:GetAttribute("Level")) or 1 local fails=0
+    while cur<M.S.MaxLevel and M.S.AutoUpgrade do
+        M.upgradeBrainrot(slot) task.wait(0.15)
+        local nw=tonumber(sm2:GetAttribute("Level")) or cur
+        if nw>cur then fails=0 cur=nw M.Status.upgradeCount+=1 else fails+=1 if fails>=60 then break end end
+    end
+end
+
+function M.findTargetToolInBackpack()
+    local bp=Player:FindFirstChild("Backpack")
+    if bp then for _, t in pairs(bp:GetChildren()) do if t:IsA("Tool") and M.toolMatchesRarity(t,M.S.TargetRarity,M.S.TargetMutation) then return t end end end
+    local ch=Player.Character if ch then local eq=ch:FindFirstChildWhichIsA("Tool") if eq and M.toolMatchesRarity(eq,M.S.TargetRarity,M.S.TargetMutation) then return eq end end
+    return nil
+end
+
+-- ============================================
+-- [MODULE 11] GENERIEKE EVENT COIN COLLECTOR
+-- Valentine + Candy samengevoegd = geen dubbele code
+-- ============================================
+local function makeEventCollector(folderName, cachedParts, lastScanRef, connRef)
+    if connRef.main then pcall(function() connRef.main:Disconnect() end) connRef.main=nil end
+    if connRef.desc then pcall(function() connRef.desc:Disconnect() end) connRef.desc=nil end
+    while #cachedParts>0 do table.remove(cachedParts) end
+    lastScanRef.t=tick()
+
+    local function cacheParts()
+        local folder=workspace:FindFirstChild(folderName) if not folder then return end
+        local fresh={}
+        for _, p in pairs(folder:GetDescendants()) do if p:IsA("BasePart") then table.insert(fresh,p) end end
+        for _, p in pairs(folder:GetChildren()) do
+            if p:IsA("BasePart") then
+                local al=false for _, f in pairs(fresh) do if f==p then al=true break end end
+                if not al then table.insert(fresh,p) end
+            end
+        end
+        for i=1,#fresh do cachedParts[i]=fresh[i] end
+        lastScanRef.t=tick()
+    end
+
+    cacheParts()
+
+    local function onNewDesc(d)
+        if not M.S.ValentineEnabled then return end
+        if d:IsA("BasePart") then
+            table.insert(cachedParts,d)
+            local hrp=Player.Character and Player.Character:FindFirstChild("HumanoidRootPart")
+            safeTouchInterest(hrp,d,0) safeTouchInterest(hrp,d,1)
+        end
+    end
+
+    local folder=workspace:FindFirstChild(folderName)
+    if folder then
+        connRef.desc=folder.DescendantAdded:Connect(onNewDesc)
+    else
+        task.spawn(function()
+            local f2=workspace:WaitForChild(folderName,60)
+            if f2 and M.S.ValentineEnabled then
+                cacheParts()
+                connRef.desc=f2.DescendantAdded:Connect(onNewDesc)
+            end
+        end)
+    end
+
+    connRef.main=RunService.Heartbeat:Connect(function()
+        if not M.S.ValentineEnabled then return end
+        pcall(function()
+            local hrp=Player.Character and Player.Character:FindFirstChild("HumanoidRootPart")
+            if not hrp then return end
+            if tick()-lastScanRef.t>5 then
+                local alive={}
+                for _, p in pairs(cachedParts) do if p and p.Parent then table.insert(alive,p) end end
+                local folder2=workspace:FindFirstChild(folderName)
+                if folder2 then
+                    for _, p in pairs(folder2:GetDescendants()) do
+                        if p:IsA("BasePart") then
+                            local found=false for _, a in pairs(alive) do if a==p then found=true break end end
+                            if not found then table.insert(alive,p) end
+                        end
+                    end
+                end
+                for i=1,#alive do cachedParts[i]=alive[i] end
+                for i=#alive+1,#cachedParts do cachedParts[i]=nil end
+                lastScanRef.t=tick()
+            end
+            for _, p in pairs(cachedParts) do
+                if p and p.Parent then safeTouchInterest(hrp,p,0) safeTouchInterest(hrp,p,1) end
+            end
+        end)
+    end)
+end
+
+local function stopEventCollector(cachedParts,connRef)
+    if connRef.main then pcall(function() connRef.main:Disconnect() end) connRef.main=nil end
+    if connRef.desc then pcall(function() connRef.desc:Disconnect() end) connRef.desc=nil end
+    while #cachedParts>0 do table.remove(cachedParts) end
+end
+
+local _valentineConnRef={main=nil,desc=nil}
+local _candyConnRef    ={main=nil,desc=nil}
+local _valentineScanRef={t=0}
+local _candyScanRef    ={t=0}
+
+-- ============================================
+-- [MODULE 12] VALENTINE EVENT
+-- ============================================
+function M.getHeartCount()
+    local count=0
+    pcall(function()
+        local ls=Player:FindFirstChild("leaderstats")
+        if ls then for _, v in pairs(ls:GetChildren()) do
+            local n=v.Name:lower()
+            if n:find("heart") or n:find("candy") or n:find("gram") or n:find("valentine") then
+                local val=tonumber(v.Value) or 0 if val>count then count=val end
+            end
+        end end
+    end)
+    if count==0 then
+        pcall(function()
+            for _, a in pairs({"Hearts","Candy","CandyGrams","Valentines","Love","CandyHearts","ValentineHearts"}) do
+                local v=Player:GetAttribute(a) if v then local n2=tonumber(v) or 0 if n2>count then count=n2 end end
+            end
+        end)
+    end
+    return count
+end
+
+function M.findCandyGramStation()
+    local station=nil
+    pcall(function() station=workspace.ValentinesMap.CandyGramStation end)
+    if station then return station end
+    for _, obj in pairs(workspace:GetDescendants()) do
+        local n=obj.Name:lower()
+        if n:find("candygram") or n:find("station") then
+            if obj:IsA("BasePart") or obj:IsA("Model") then return obj end
+        end
+    end
+    return nil
+end
+
+function M.getStationPosition()
+    local station=M.findCandyGramStation() if not station then return nil end
+    if station:IsA("BasePart") then return station.Position end
+    if station:IsA("Model") then
+        local pos=nil pcall(function() pos=station:GetPivot().Position end)
+        if not pos then for _, d in pairs(station:GetDescendants()) do if d:IsA("BasePart") then pos=d.Position break end end end
+        return pos
+    end
+    return nil
+end
+
+function M.submitCandyGrams()
+    local stationPos=M.getStationPosition()
+    if not stationPos then M.Status.valentine="⚠️ Station niet gevonden!" task.wait(2) return false end
+    M.tweenTo(CFrame.new(stationPos.X,M.S.GodWalkY,stationPos.Z)) task.wait(0.3)
+    local fired=false local station=M.findCandyGramStation()
+    if station then
+        fireAllPrompts(station)
+        if station.Parent and not station.Parent:IsA("Workspace") then fireAllPrompts(station.Parent) end
+        local hrp=Player.Character and Player.Character:FindFirstChild("HumanoidRootPart")
+        if hrp then touchAllParts(hrp,station) end
+        fired=true
+    end
+    if not fired then
+        local hrp=Player.Character and Player.Character:FindFirstChild("HumanoidRootPart")
+        if hrp then
+            for _, obj in pairs(workspace:GetDescendants()) do
+                if obj:IsA("ProximityPrompt") and obj.Parent and obj.Parent:IsA("BasePart") then
+                    if (obj.Parent.Position-hrp.Position).Magnitude<50 then safeFirePrompt(obj) fired=true end
+                end
+            end
+        end
+    end
+    task.wait(0.5) return fired
+end
+
+function M.startValentine()
+    if M.valentineThread then return end
+    M.S.ValentineEnabled=true M.Status.valentineCount=0 M.Status.valentine="Opstarten..."
+    if not M._isGod then M.enableGod() end
+    makeEventCollector("ValentinesCoinParts",M._valentineCachedParts,_valentineScanRef,_valentineConnRef)
+    makeEventCollector("CandyEventParts",    M._candyCachedParts,    _candyScanRef,    _candyConnRef)
+    M.valentineThread=task.spawn(function()
+        local submitCount=0
+        while M.S.ValentineEnabled do
+            local ok,err=pcall(function()
+                if M.isDead() then M.waitForRespawn() task.wait(1) if not M._isGod then M.enableGod() end return end
+                local h=M.getHeartCount()
+                M.Status.valentine="💝 "..h.."/100 | 🪙 "..#M._valentineCachedParts.." | 🍬 "..#M._candyCachedParts.." | #"..submitCount
+                if h>=100 then
+                    M.Status.valentine="🏃 Naar station... H:"..h
+                    if M.submitCandyGrams() then
+                        local prevH=h local ws=tick()
+                        repeat task.wait(0.3) h=M.getHeartCount() until h<prevH or tick()-ws>5
+                        if h<prevH then
+                            submitCount+=1 M.Status.valentineCount=submitCount
+                            M.Status.valentine="✅ Submit #"..submitCount.." | Nu: "..h.." hearts"
+                        else M.Status.valentine="⚠️ Submit mislukt? H:"..h end
+                    else M.Status.valentine="⚠️ Kon niet submiten, retry..." task.wait(2) end
+                    task.wait(0.5)
+                else task.wait(1) end
+            end)
+            if not ok then task.wait(1) end
+        end
+        stopEventCollector(M._valentineCachedParts,_valentineConnRef)
+        stopEventCollector(M._candyCachedParts,    _candyConnRef)
+        M.Status.valentine="Idle" M.valentineThread=nil
+    end)
+end
+
+function M.stopValentine()
+    M.S.ValentineEnabled=false
+    if M.valentineThread then pcall(task.cancel,M.valentineThread) M.valentineThread=nil end
+    stopEventCollector(M._valentineCachedParts,_valentineConnRef)
+    stopEventCollector(M._candyCachedParts,    _candyConnRef)
+    M.Status.valentine="Idle"
+end
+
+-- ============================================
+-- [MODULE 13] ARCADE / MONEY / UPGRADE / AFK / INSTANT
+-- ============================================
+function M.startArcade()
+    if M.arcadeThread then return end M.S.ArcadeEnabled=true M.Status.arcadeCount=0
+    M.arcadeThread=task.spawn(function()
+        while M.S.ArcadeEnabled do
+            pcall(function()
+                local hrp=Player.Character and Player.Character:FindFirstChild("HumanoidRootPart") if not hrp then return end
+                for _, fn in pairs({"ArcadeEventConsoles","ArcadeEventTickets"}) do
+                    local f=workspace:FindFirstChild(fn)
+                    if f then for _, item in pairs(f:GetChildren()) do for _, d in pairs(item:GetDescendants()) do
+                        if d:IsA("BasePart") and d:FindFirstChild("TouchInterest") then
+                            safeTouchInterest(hrp,d,0) task.wait(0.01) safeTouchInterest(hrp,d,1) M.Status.arcadeCount+=1
+                        end
+                    end end end
+                end
+            end)
+            task.wait(0.05)
+        end
+        M.Status.arcade="Idle" M.arcadeThread=nil
+    end)
+end
+
+function M.stopArcade()
+    M.S.ArcadeEnabled=false
+    if M.arcadeThread then pcall(task.cancel,M.arcadeThread) M.arcadeThread=nil end
+    M.Status.arcade="Idle"
+end
+
+function M.startMoney()
+    if M.moneyThread then return end M.S.AutoCollectMoney=true M.Status.money="Actief"
+    if not M.baseGUID then M.findBase() end
+    M.moneyThread=task.spawn(function()
+        while M.S.AutoCollectMoney do
+            pcall(function()
+                if not M.baseGUID then M.findBase() end if not M.baseGUID then return end
+                local mb=workspace:FindFirstChild("Bases") and workspace.Bases:FindFirstChild(M.baseGUID)
+                local hrp=Player.Character and Player.Character:FindFirstChild("HumanoidRootPart")
+                if not mb or not hrp then return end
+                for i=1,M.getSlotCount() do
+                    local sm2=mb:FindFirstChild("slot "..i.." brainrot")
+                    if sm2 and sm2:GetAttribute("BrainrotName") and sm2:GetAttribute("BrainrotName")~="" then
+                        touchAllParts(hrp,sm2)
+                    end
+                end
+            end)
+            task.wait(0.5)
+        end
+        M.Status.money="Idle"
+    end)
+    M.moneyRemoteThread=task.spawn(function()
+        while M.S.AutoCollectMoney do
+            pcall(function()
+                if not M.baseGUID then M.findBase() end
+                if not M.baseGUID or not M.PlotAction then return end
+                for i=1,M.getSlotCount() do
+                    if not M.S.AutoCollectMoney then break end
+                    throttledPlotAction("Collect Money",M.baseGUID,tostring(i))
+                end
+            end)
+            task.wait(5)
+        end
+    end)
+end
+
+function M.stopMoney()
+    M.S.AutoCollectMoney=false
+    if M.moneyThread       then pcall(task.cancel,M.moneyThread)       M.moneyThread=nil end
+    if M.moneyRemoteThread then pcall(task.cancel,M.moneyRemoteThread) M.moneyRemoteThread=nil end
+    M.Status.money="Idle"
+end
+
+function M.startAutoUpgrade()
+    if M.upgradeThread then return end M.S.AutoUpgrade=true M.Status.upgradeCount=0
+    M.upgradeThread=task.spawn(function()
+        while M.S.AutoUpgrade do
+            pcall(function()
+                for _, info in pairs(M.findOccupiedSlots()) do
+                    if not M.S.AutoUpgrade then break end
+                    if info.level<M.S.MaxLevel then M.upgradeSlotToMax(info.slot) end
+                end
+                M.Status.upgrade="Klaar (#"..M.Status.upgradeCount..")"
+            end)
+            task.wait(5)
+        end
+        M.Status.upgrade="Idle"
+    end)
+end
+
+function M.stopAutoUpgrade()
+    M.S.AutoUpgrade=false
+    if M.upgradeThread then pcall(task.cancel,M.upgradeThread) M.upgradeThread=nil end
+    M.Status.upgrade="Idle"
+end
+
+function M.startAFK()
+    if M.afkThread then return end M.S.AntiAFK=true M.Status.afk="Actief"
+    pcall(function() for _, c in pairs(getconnections(Player.Idled)) do c:Disable() end end)
+    M.afkThread=task.spawn(function()
+        while M.S.AntiAFK do
+            pcall(function() for _, c in pairs(getconnections(Player.Idled)) do c:Disable() end end)
+            pcall(function()
+                local vu=game:GetService("VirtualUser")
+                vu:Button2Down(Vector2.new(0,0),workspace.CurrentCamera.CFrame) task.wait(0.1)
+                vu:Button2Up(Vector2.new(0,0),workspace.CurrentCamera.CFrame)
+            end)
+            task.wait(60)
+        end
+        M.Status.afk="Uit"
+    end)
+end
+
+function M.stopAFK()
+    M.S.AntiAFK=false
+    if M.afkThread then pcall(task.cancel,M.afkThread) M.afkThread=nil end
+    if M._afkSteppedConn then pcall(function() M._afkSteppedConn:Disconnect() end) M._afkSteppedConn=nil end
+    M.Status.afk="Uit"
+end
+
+function M.setupInstant()
+    for _, o in pairs(workspace:GetDescendants()) do if o:IsA("ProximityPrompt") then pcall(function() o.HoldDuration=0 end) end end
+    if not M._instantConn then
+        M._instantConn=workspace.DescendantAdded:Connect(function(o)
+            if o:IsA("ProximityPrompt") then pcall(function() o.HoldDuration=0 end) end
+        end)
+    end
+end
+M.setupInstant()
+
+-- ============================================
+-- [MODULE 14] LUCKY BLOCKS
+-- ============================================
+function M.getLuckyBlockRarities() return type(M.S.LuckyBlockRarity)=="table" and M.S.LuckyBlockRarity or {M.S.LuckyBlockRarity} end
+function M.luckyBlockRarityMatches(bn) for _, r in pairs(M.getLuckyBlockRarities()) do if r=="Any" or bn:find(r) or bn==r then return true end end return false end
+function M.luckyBlockMutationMatches(block)
+    local mut=block:GetAttribute("Mutation") or "None" local isNone=(mut:lower()=="none" or mut=="")
+    if M.S.LuckyBlockMutation=="Any" then return true end
+    if M.S.LuckyBlockMutation=="None" then return isNone end
+    return mut==M.S.LuckyBlockMutation
+end
+function M.findLuckyBlockRoot(block)
+    local r=block:FindFirstChild("Root") if r and r:IsA("BasePart") then return r end
+    if block:IsA("BasePart") then return block end
+    local p2=nil pcall(function() p2=block.PrimaryPart end) if p2 then return p2 end
+    for _, d in pairs(block:GetDescendants()) do if d:IsA("BasePart") then return d end end
+    return nil
+end
+function M.grabLuckyBlock(block,rootPart)
+    if not block or not rootPart then return end
+    fireAllPrompts(block)
+    local hrp=Player.Character and Player.Character:FindFirstChild("HumanoidRootPart")
+    if hrp then safeTouchInterest(hrp,rootPart,0) safeTouchInterest(hrp,rootPart,1) touchAllParts(hrp,block) end
+end
+function M.startLuckyBlockFarm()
+    if M.luckyBlockThread then return end M.S.LuckyBlockEnabled=true M.Status.luckyBlockCount=0 M.setHomePosition()
+    M.luckyBlockThread=task.spawn(function()
+        while M.S.LuckyBlockEnabled do
+            pcall(function()
+                if M.isDead() then M.waitForRespawn() task.wait(1) M.setHomePosition() return end
+                if not M.ActiveLuckyBlocks then M.ActiveLuckyBlocks=workspace:FindFirstChild("ActiveLuckyBlocks") end
+                if not M.ActiveLuckyBlocks then task.wait(3) return end
+                local foundBlock=false
+                for _, block in pairs(M.ActiveLuckyBlocks:GetChildren()) do
+                    if not M.S.LuckyBlockEnabled or M.isDead() then break end
+                    if M.luckyBlockRarityMatches(block.Name) and M.luckyBlockMutationMatches(block) then
+                        local rootPart=M.findLuckyBlockRoot(block) if not rootPart then continue end
+                        foundBlock=true
+                        if M._isGod then M.safePathTo(rootPart.CFrame*CFrame.new(0,3,0)) else M.tweenTo(rootPart.CFrame*CFrame.new(0,3,0)) end
+                        M.grabLuckyBlock(block,rootPart)
+                        local t2=tick()
+                        while tick()-t2<0.2 do if not block.Parent or not rootPart.Parent then break end task.wait(0.02) end
+                        if not block.Parent or not rootPart.Parent then M.Status.luckyBlockCount+=1 end
+                        M.safeUnequip()
+                        if M._isGod then M.safeReturnToBase() else M.returnToBase() end
+                        break
+                    end
+                end
+                if not foundBlock then task.wait(2) end
+            end)
+            task.wait(0.1)
+        end
+        M.Status.luckyBlock="Idle" M.luckyBlockThread=nil
+    end)
+end
+function M.stopLuckyBlockFarm()
+    M.S.LuckyBlockEnabled=false
+    if M.luckyBlockThread then pcall(task.cancel,M.luckyBlockThread) M.luckyBlockThread=nil end
+    M.Status.luckyBlock="Idle"
+end
+
+-- ============================================
+-- [MODULE 15] FACTORY
+-- ============================================
+local function factoryToolMatchesRarity(tool)
+    local tMut=tool:GetAttribute("Mutation") or "None" local lvl=tonumber(tool:GetAttribute("Level")) or 0
+    local bName=tool:GetAttribute("BrainrotName") local toolRarity=tool:GetAttribute("Rarity")
+    if not bName or bName=="" then return false end
+    if toolRarity and M.isHighRarity(toolRarity) then return M.S.FactoryRarity=="Any" or M.S.FactoryRarity==toolRarity end
+    if lvl>=M.S.FactoryMaxLevel then return false end
+    if M.S.FactoryMutation=="None" then if not (tMut:lower()=="none" or tMut=="") then return false end
+    elseif M.S.FactoryMutation~="Any" then if tMut~=M.S.FactoryMutation then return false end end
+    if M.S.FactoryRarity~="Any" then
+        if toolRarity and toolRarity~="" then if toolRarity~=M.S.FactoryRarity then return false end
+        else local wl={} for _, n in pairs(M.getBrainrotNames(M.S.FactoryRarity)) do wl[n]=true end if not wl[bName] then return false end end
+    end
+    return true
+end
+
+function M.startFactoryLoop()
+    if M.factoryThread then return end M.S.FactoryEnabled=true M.Status.factoryCount=0
+    M.factoryThread=task.spawn(function()
+        local stopReason="Idle"
+        while M.S.FactoryEnabled do
+            local ok,err=pcall(function()
+                if not M.baseGUID then M.findBase() end if not M.baseGUID then task.wait(2) return end
+                local ws=tonumber(M.S.FactorySlot) or 5
+                M.tweenToSlot(ws) task.wait(0.2)
+                if not M.isSlotEmpty(ws) then M.pickUpBrainrot(ws) task.wait(1) pcall(function() Player.Character.Humanoid:UnequipTools() end) task.wait(0.5) end
+                local tool=nil local sa=0
+                while not tool and sa<5 do
+                    sa+=1
+                    local bp=Player:FindFirstChild("Backpack")
+                    if bp then for _, t in pairs(bp:GetChildren()) do if t:IsA("Tool") and factoryToolMatchesRarity(t) then tool=t break end end end
+                    if not tool and Player.Character then local eq=Player.Character:FindFirstChildWhichIsA("Tool") if eq and factoryToolMatchesRarity(eq) then tool=eq end end
+                    if not tool and sa<5 then task.wait(0.6) end
+                end
+                if not tool then stopReason="Klaar! (geen tools meer)" M.S.FactoryEnabled=false return end
+                local bName=tool:GetAttribute("BrainrotName") or "Item"
+                local toolRarity=tool:GetAttribute("Rarity") or "" local isHighTool=M.isHighRarity(toolRarity)
+                local hum=Player.Character and Player.Character:FindFirstChild("Humanoid")
+                if hum then hum:EquipTool(tool) task.wait(0.5) end
+                M.placeBrainrot(ws) task.wait(0.8)
+                if M.isSlotEmpty(ws) then pcall(function() if hum then hum:UnequipTools() end end) task.wait(1) return end
+                if not isHighTool then
+                    local myBase=workspace:FindFirstChild("Bases") and workspace.Bases:FindFirstChild(M.baseGUID)
+                    local sm2=myBase and myBase:FindFirstChild("slot "..ws.." brainrot")
+                    if sm2 then
+                        local cur=tonumber(sm2:GetAttribute("Level")) or 0 local fails=0
+                        while cur<M.S.FactoryMaxLevel and M.S.FactoryEnabled do
+                            M.upgradeBrainrot(ws) task.wait(0.1)
+                            local nw=tonumber(sm2:GetAttribute("Level")) or cur
+                            if nw>cur then fails=0 cur=nw M.Status.factory=bName.." Lv."..cur.."/"..M.S.FactoryMaxLevel
+                            else fails+=1 if fails>60 then stopReason="Geld op!" M.S.FactoryEnabled=false break end end
+                        end
+                    end
+                else M.Status.factory="★ "..toolRarity..": "..bName.." (gezet)" task.wait(1) end
+                task.wait(0.5) M.pickUpBrainrot(ws) task.wait(1.2) M.Status.factoryCount+=1
+                pcall(function() if hum then hum:UnequipTools() end end) task.wait(0.5)
+                M.Status.factory=(isHighTool and "★ Done " or "Done ")..bName.." (#"..M.Status.factoryCount..")"
+            end)
+            if not ok then task.wait(1) end
+        end
+        M.Status.factory=stopReason M.factoryThread=nil
+    end)
+end
+
+function M.stopFactoryLoop()
+    M.S.FactoryEnabled=false
+    if M.factoryThread then pcall(task.cancel,M.factoryThread) M.factoryThread=nil end
+    if not (string.find(M.Status.factory or "","Done") or string.find(M.Status.factory or "","Klaar") or string.find(M.Status.factory or "","Geld op")) then
+        M.Status.factory="Idle"
+    end
+end
+
+-- ============================================
+-- [MODULE 16] FARMING
+-- ============================================
+function M.startFarming()
+    if M.farmThread then return end M.S.Farming=true M.Status.farmCount=0
+    M.setHomePosition() M.detectWallZ() M.returnToBase()
+    M.farmThread=task.spawn(function()
+        while M.S.Farming do
+            local ok,err=pcall(function()
+                if M.isDead() then M.waitForRespawn() task.wait(1) M.setHomePosition() task.wait(0.5) return end
+                local ch=Player.Character local hum=ch and ch:FindFirstChild("Humanoid")
+                if not ch or not hum then task.wait(1) return end
+                if not M.baseGUID then M.findBase() end if not M.baseGUID then task.wait(2) return end
+                local ws=tonumber(M.S.FarmSlot) or 5
+
+                if M.S.FarmMode=="Collect" then
+                    if not M.ActiveBrainrots then M.ActiveBrainrots=workspace:FindFirstChild("ActiveBrainrots") end
+                    if M.ActiveBrainrots then
+                        for _, folder in pairs(M.ActiveBrainrots:GetChildren()) do
+                            if not M.S.Farming then break end
+                            if folder:IsA("Folder") and M.rarityMatches(folder.Name) then
+                                for _, b in pairs(folder:GetChildren()) do
+                                    if not M.S.Farming or M.isDead() then break end
+                                    if M.matchesFilter(b,folder.Name) then
+                                        local root=M.findBrainrotRoot(b) if not root then continue end
+                                        M.Status.farm="Ophalen "..folder.Name
+                                        if M._isGod then M.safePathTo(root.CFrame*CFrame.new(0,3,0)) else M.tweenTo(root.CFrame*CFrame.new(0,3,0)) end
+                                        for attempt=1,5 do
+                                            if not M.S.Farming then break end
+                                            if M.isDead() then M.waitForRespawn() task.wait(1) M.setHomePosition()
+                                                if root and root.Parent then if M._isGod then M.safePathTo(root.CFrame*CFrame.new(0,3,0)) else M.tweenTo(root.CFrame*CFrame.new(0,3,0)) end else break end
+                                            end
+                                            if root and root.Parent then M.forceGrabPrompt(root) M.forceGrabPrompt(b) task.wait(0.3) M.Status.farmCount+=1 break else break end
+                                        end
+                                        M.safeUnequip() task.wait(0.1)
+                                        if M._isGod then M.safeReturnToBase() else M.returnToBase() end
+                                    end
+                                end
+                            end
+                        end
+                    end
+                    task.wait(1) return
+                end
+
+                if not M.isSlotEmpty(ws) then M.pickUpBrainrot(ws) task.wait(0.5) M.safeUnequip() task.wait(0.3) end
+                local tool=M.findTargetToolInBackpack()
+                if tool and M.isHighRarityTool(tool) then M.Status.farm="High "..(tool:GetAttribute("Rarity") or "High") M.Status.farmCount+=1 task.wait(0.5) tool=nil end
+                if not tool then
+                    local found=false
+                    if not M.ActiveBrainrots then M.ActiveBrainrots=workspace:FindFirstChild("ActiveBrainrots") end
+                    if M.ActiveBrainrots then
+                        for _, folder in pairs(M.ActiveBrainrots:GetChildren()) do
+                            if not M.S.Farming then break end
+                            if folder:IsA("Folder") and M.rarityMatches(folder.Name) then
+                                for _, b in pairs(folder:GetChildren()) do
+                                    if not M.S.Farming or M.isDead() then break end
+                                    if M.matchesFilter(b,folder.Name) then
+                                        local root=M.findBrainrotRoot(b) if not root then continue end
+                                        found=true M.Status.farm="Ophalen "..folder.Name
+                                        if M._isGod then M.safePathTo(root.CFrame*CFrame.new(0,3,0)) else M.tweenTo(root.CFrame*CFrame.new(0,3,0)) end
+                                        for attempt=1,5 do
+                                            if not M.S.Farming then break end
+                                            if M.isDead() then M.waitForRespawn() task.wait(1) M.setHomePosition()
+                                                if not M.S.Farming then break end
+                                                if root and root.Parent then if M._isGod then M.safePathTo(root.CFrame*CFrame.new(0,3,0)) else M.tweenTo(root.CFrame*CFrame.new(0,3,0)) end else found=false break end
+                                            end
+                                            if root and root.Parent then M.forceGrabPrompt(root) M.forceGrabPrompt(b) task.wait(0.3) M.Status.farmCount+=1 break else found=false break end
+                                        end
+                                        M.safeUnequip() task.wait(0.1)
+                                        if M._isGod then M.safeReturnToBase() else M.returnToBase() end
+                                        break
+                                    end
+                                end
+                            end
+                            if found then break end
+                        end
+                    end
+                    if not found then M.Status.farm="Wachten..." task.wait(2) return end
+                    task.wait(0.3) tool=M.findTargetToolInBackpack() if not tool then task.wait(1) return end
+                end
+                if M.isHighRarityTool(tool) then M.Status.farm="High" M.Status.farmCount+=1 task.wait(0.5) return end
+                local bName=tool:GetAttribute("BrainrotName") or "Brainrot"
+                M.tweenToSlot(ws) task.wait(0.3) M.safeEquip(tool) task.wait(0.5)
+                M.placeBrainrot(ws) task.wait(0.8)
+                if M.isSlotEmpty(ws) then M.safeUnequip() task.wait(1) return end
+                local mb=workspace:FindFirstChild("Bases") and workspace.Bases:FindFirstChild(M.baseGUID)
+                local sm2=mb and mb:FindFirstChild("slot "..ws.." brainrot")
+                if sm2 then
+                    local cur=tonumber(sm2:GetAttribute("Level")) or 0 local fails=0
+                    while cur<M.S.MaxLevel and M.S.Farming do
+                        M.upgradeBrainrot(ws) task.wait(0.15)
+                        local nw=tonumber(sm2:GetAttribute("Level")) or cur
+                        if nw>cur then fails=0 cur=nw M.Status.upgradeCount+=1 M.Status.farm=bName.." Lv."..cur.."/"..M.S.MaxLevel
+                        else fails+=1 if fails>60 then break end end
+                    end
+                end
+                task.wait(0.3) M.pickUpBrainrot(ws) task.wait(0.8) M.safeUnequip() task.wait(0.3)
+                if not M.isSlotEmpty(ws) then M.pickUpBrainrot(ws) task.wait(0.5) M.safeUnequip() task.wait(0.3) end
+            end)
+            if not ok then task.wait(1) end
+            task.wait(0.3)
+        end
+        M.Status.farm="Idle" M.farmThread=nil
+    end)
+end
+
+function M.stopFarming()
+    M.S.Farming=false
+    if M.farmThread then pcall(task.cancel,M.farmThread) M.farmThread=nil end
+    M.Status.farm="Idle"
+end
+
+-- ============================================
+-- [MODULE 17] MAP FIXER
+-- ============================================
+local MF={W=420,WH=220,WT=6,INT=8} MF.SZ=MF.W/2 MF.WY=100
+local function safeDestroyFolder(parent,fn)
+    if not parent then return end local f=parent:FindFirstChild(fn)
+    if not f or f.Name=="MzDHubWalls" then return end
+    pcall(function() for _, d in pairs(f:GetDescendants()) do if d:IsA("BasePart") then d:Destroy() end end f:Destroy() end)
+end
+local MAP_FOLDERS_REMOVE={"RightWalls","LeftWalls","Gaps","VIPWalls","SideWalls","Barriers","Fences","Walls","Decorations"}
+local EVENT_MAPS={"ValentinesMap","ArcadeMap","CandyMap","HalloweenMap","ChristmasMap","EasterMap","SummerMap","SpringMap","WinterMap","DoomMap"}
+local function isWallPart(p)
+    if not p:IsA("BasePart") then return false end if isMzDPart(p) then return false end
+    local n=p.Name:lower()
+    for _, k in pairs({"vipwall","sidewall","barrier","fence","blocker","border"}) do if n==k or n:find("^"..k) then return true end end
+    if p.Size.Y>15 and p.Size.Y>p.Size.X*3 and p.Size.Y>p.Size.Z*3 and math.abs(p.Position.Z)>60 then return true end
+    return false
+end
+function M.mapFindShared(mn) return workspace:FindFirstChild(mn.."_SharedInstances") end
+function M.mapDetectXRange(map,si)
+    local minX,maxX=math.huge,-math.huge local found=false
+    local function chk(p)
+        if not p:IsA("BasePart") or isMzDPart(p) then return end
+        if p.Size.Y>p.Size.X and p.Size.Y>p.Size.Z then return end
+        if p.Position.Y>50 or p.Position.Y<-30 or p.Size.X<5 then return end
+        local l=p.Position.X-p.Size.X/2 local r=p.Position.X+p.Size.X/2
+        if l<minX then minX=l end if r>maxX then maxX=r end found=true
+    end
+    if map then for _, d in pairs(map:GetDescendants()) do if d:IsA("BasePart") then chk(d) end end end
+    if si then
+        for _, c in pairs(si:GetChildren()) do if c:IsA("BasePart") then chk(c) end end
+        local sf=si:FindFirstChild("Floors") if sf then for _, f in pairs(sf:GetChildren()) do chk(f) end end
+    end
+    if found and maxX>minX then return minX-5,maxX+5 end return -15,4385
+end
+local function getFloorParts(map,si)
+    local fl={} local seen={}
+    local function af(p)
+        if not p:IsA("BasePart") or isMzDPart(p) or seen[p] then return end
+        if p.Size.Y>p.Size.X and p.Size.Y>p.Size.Z then return end
+        if p.Position.Y>30 or p.Position.Y<-20 or p.Size.X<5 then return end
+        seen[p]=true table.insert(fl,p)
+    end
+    if map then for _, d in pairs(map:GetDescendants()) do if d:IsA("BasePart") and not isMzDPart(d) then
+        local n=d.Name:lower()
+        if n=="firstfloor" or n=="ground" or n=="bridgefloor" or n=="floor" or n=="grass" or n=="path" or n=="road" or n=="platform" then af(d)
+        elseif d.Size.X>50 and d.Size.Z>10 and d.Size.Y<10 then af(d) end
+    end end end
+    if si then
+        local sf=si:FindFirstChild("Floors") if sf then for _, f in pairs(sf:GetChildren()) do if f:IsA("BasePart") then af(f) end end end
+        for _, c in pairs(si:GetChildren()) do if c:IsA("BasePart") and c.Size.X>50 and c.Size.Z>10 and c.Size.Y<10 then af(c) end end
+    end
+    return fl
+end
+local DECO_NAMES={"Deco","Decoration","Decorations","Decor","Props","Prop","Effects","VFX","Extras","Extra"}
+function M.removeMapDeco(map)
+    if not map then return 0 end local removed=0
+    for _, dn in pairs(DECO_NAMES) do local d=map:FindFirstChild(dn) if d then pcall(function() d:Destroy() removed+=1 end) end end
+    for _, child in pairs(map:GetChildren()) do
+        if child:IsA("Folder") or child:IsA("Model") then
+            local n=child.Name:lower()
+            for _, dn in pairs(DECO_NAMES) do if n==dn:lower() then pcall(function() child:Destroy() removed+=1 end) break end end
+        end
+    end
+    return removed
+end
+function M.mapCleanup(map)
+    for _, n in pairs(MAP_FOLDERS_REMOVE) do safeDestroyFolder(map,n) end M.removeMapDeco(map)
+    for _, d in pairs(map:GetDescendants()) do if d.Parent and not isMzDPart(d) and d:IsA("BasePart") and isWallPart(d) then pcall(function() d:Destroy() end) end end
+end
+function M.mapCleanupShared(si)
+    if not si then return end
+    for _, n in pairs(MAP_FOLDERS_REMOVE) do safeDestroyFolder(si,n) end M.removeMapDeco(si)
+    for _, d in pairs(si:GetDescendants()) do if d:IsA("BasePart") and not isMzDPart(d) and isWallPart(d) then pcall(function() d:Destroy() end) end end
+end
+function M.mapCleanupMisc()
+    local misc=workspace:FindFirstChild("Misc") if not misc then return end
+    for _, c in pairs(misc:GetChildren()) do if c.Name=="BrickAddition" or c.Name=="Roof" then pcall(function() c:Destroy() end) end end
+end
+function M.cleanupEventMaps()
+    for _, mn in pairs(EVENT_MAPS) do local em=workspace:FindFirstChild(mn) if em then
+        for _, fn in pairs(MAP_FOLDERS_REMOVE) do safeDestroyFolder(em,fn) end M.removeMapDeco(em)
+        for _, d in pairs(em:GetDescendants()) do if d:IsA("BasePart") and not isMzDPart(d) and isWallPart(d) then pcall(function() d:Destroy() end) end end
+    end end
+end
+function M.mapWidenFloors(map,si)
+    for _, p in pairs(getFloorParts(map,si)) do pcall(function()
+        if math.abs(p.Size.Z-MF.W)>1 then p.Size=Vector3.new(p.Size.X,p.Size.Y,MF.W) p.Position=Vector3.new(p.Position.X,p.Position.Y,0) end
+    end) end
+end
+function M.mapFillGaps(map,sx,ex)
+    local ref=nil
+    for _, d in pairs(map:GetDescendants()) do if d:IsA("BasePart") and not isMzDPart(d) then local n=d.Name:lower() if n=="firstfloor" or n=="ground" then ref=d break end end end
+    if not ref then local sp=map:FindFirstChild("Spawners") if sp then for _, s in pairs(sp:GetChildren()) do if s:IsA("BasePart") then ref=s break end end end end
+    if not ref then for _, d in pairs(map:GetDescendants()) do if d:IsA("BasePart") and not isMzDPart(d) and d.Size.X>50 and d.Size.Y<10 and d.Position.Y<20 then ref=d break end end end
+    if not ref then return end
+    local fY,fH,fC,fM2=ref.Position.Y,ref.Size.Y,ref.Color,ref.Material
+    for _, c in pairs(map:GetChildren()) do if c:IsA("BasePart") and c.Name=="BridgeFloor" then pcall(function() c:Destroy() end) end end
+    local maxSeg,curX=2000,sx
+    while curX<ex do
+        local segLen=math.min(maxSeg,ex-curX)
+        local b=Instance.new("Part") b.Name="BridgeFloor" b.Size=Vector3.new(segLen,fH,MF.W)
+        b.Position=Vector3.new(curX+segLen/2,fY,0) b.Anchored=true b.CanCollide=true b.Color=fC b.Material=fM2
+        b.TopSurface=Enum.SurfaceType.Smooth b.BottomSurface=Enum.SurfaceType.Smooth b.Parent=map
+        curX=curX+segLen
+    end
+end
+function M.mapBuildWalls(map,sx,ex)
+    local WALL_BOTTOM,WALL_H=-25,300 local WALL_MID_Y=WALL_BOTTOM+WALL_H/2
+    local floorTop=M.S.GodFloorY+2 local sBot=floorTop+1 local sMid=floorTop+WALL_H*0.2 local sTop=floorTop+WALL_H*0.85
+    local mf=map:FindFirstChild("MzDHubWalls")
+    if mf then
+        local fw=mf:FindFirstChild("FrontWall_1")
+        if fw and math.abs(fw.Size.Y-WALL_H)<1 and math.abs(fw.Position.Y-WALL_MID_Y)<1 then
+            M._wallZ_front=MF.SZ-3 M._wallZ_back=-MF.SZ+3 return
+        end
+        pcall(function() mf:Destroy() end)
+    end
+    mf=Instance.new("Folder") mf.Name="MzDHubWalls" mf.Parent=map
+    local theme=getThemeColors()
+    local function mw(nm,sz,ps)
+        local w=Instance.new("Part") w.Name=nm w.Size=sz w.Position=ps w.Anchored=true w.CanCollide=true
+        w.Color=theme.wall w.Material=Enum.Material.SmoothPlastic w.TopSurface=Enum.SurfaceType.Smooth w.BottomSurface=Enum.SurfaceType.Smooth w.Parent=mf return w
+    end
+    local function ms(nm,sz,ps)
+        local s=Instance.new("Part") s.Name=nm s.Size=sz s.Position=ps s.Anchored=true s.CanCollide=false s.Color=theme.stripe s.Material=Enum.Material.Neon s.Parent=mf
+    end
+    local function addWallLogo(w,face)
+        local sg=Instance.new("SurfaceGui") sg.Face=face sg.CanvasSize=Vector2.new(1600,500) sg.AlwaysOnTop=false sg.Parent=w
+        local t1=Instance.new("TextLabel") t1.Size=UDim2.new(1,0,0.6,0) t1.Position=UDim2.new(0,0,0.05,0) t1.BackgroundTransparency=1
+        t1.Text="MzD Hub" t1.TextColor3=theme.glow t1.TextScaled=true t1.Font=Enum.Font.GothamBold t1.Parent=sg
+        local t2=Instance.new("TextLabel") t2.Size=UDim2.new(0.5,0,0.2,0) t2.Position=UDim2.new(0.25,0,0.68,0) t2.BackgroundTransparency=1
+        t2.Text="v13.0" t2.TextColor3=Color3.fromRGB(200,200,200) t2.TextScaled=true t2.Font=Enum.Font.Gotham t2.Parent=sg
+        local line=Instance.new("Frame") line.Size=UDim2.new(0.7,0,0.025,0) line.Position=UDim2.new(0.15,0,0.65,0) line.BackgroundColor3=theme.stripe line.BorderSizePixel=0 line.Parent=sg
+    end
+    local segs={} local p2=sx
+    while p2<ex do local l=math.min(2000,ex-p2) table.insert(segs,{s=p2,l=l}) p2=p2+l end
+    for i,seg in pairs(segs) do
+        local cx=seg.s+seg.l/2
+        local fw2=mw("FrontWall_"..i,Vector3.new(seg.l,WALL_H,MF.WT),Vector3.new(cx,WALL_MID_Y,MF.SZ+MF.WT/2))
+        addWallLogo(fw2,Enum.NormalId.Front) addWallLogo(fw2,Enum.NormalId.Back)
+        ms("FS_bot"..i,Vector3.new(seg.l,2,0.4),Vector3.new(cx,sBot,MF.SZ+MF.WT+0.3))
+        ms("FS_mid"..i,Vector3.new(seg.l,1,0.4),Vector3.new(cx,sMid,MF.SZ+MF.WT+0.3))
+        ms("FS_top"..i,Vector3.new(seg.l,2,0.4),Vector3.new(cx,sTop,MF.SZ+MF.WT+0.3))
+        local bw2=mw("BackWall_"..i,Vector3.new(seg.l,WALL_H,MF.WT),Vector3.new(cx,WALL_MID_Y,-MF.SZ-MF.WT/2))
+        addWallLogo(bw2,Enum.NormalId.Front) addWallLogo(bw2,Enum.NormalId.Back)
+        ms("BS_bot"..i,Vector3.new(seg.l,2,0.4),Vector3.new(cx,sBot,-MF.SZ-MF.WT-0.3))
+        ms("BS_mid"..i,Vector3.new(seg.l,1,0.4),Vector3.new(cx,sMid,-MF.SZ-MF.WT-0.3))
+        ms("BS_top"..i,Vector3.new(seg.l,2,0.4),Vector3.new(cx,sTop,-MF.SZ-MF.WT-0.3))
+    end
+    local totalZ=MF.SZ*2+MF.WT*2+2
+    mw("LeftWall",Vector3.new(MF.WT,WALL_H,totalZ),Vector3.new(sx-MF.WT/2,WALL_MID_Y,0))
+    mw("RightWall",Vector3.new(MF.WT,WALL_H,totalZ),Vector3.new(ex+MF.WT/2,WALL_MID_Y,0))
+    M._wallZ_front=MF.SZ-3 M._wallZ_back=-MF.SZ+3
+end
+function M.mapFixCollision(map,si)
+    for _, p in pairs(getFloorParts(map,si)) do
+        if M._isGod then pcall(function() p.CanCollide=false p.Transparency=1 end)
+        else pcall(function() p.CanCollide=true p.Transparency=0 end) end
+    end
+    for _, c in pairs(map:GetChildren()) do if c:IsA("BasePart") and c.Name=="BridgeFloor" then
+        if M._isGod then pcall(function() c.CanCollide=false c.Transparency=1 end) else pcall(function() c.CanCollide=true end) end
+    end end
+    local mf2=map:FindFirstChild("MzDHubWalls") if not mf2 then return end
+    for _, w in pairs(mf2:GetChildren()) do if w:IsA("BasePart") then
+        local n=w.Name
+        if n:find("FS_") or n:find("BS_") then w.CanCollide=false else w.CanCollide=true w.Anchored=true end
+    end end
+end
+M._lastFixedMapName=""
+function M.mapRunFix()
+    local map=M.mapFindCurrentMap() if not map then return end
+    local si=M.mapFindShared(map.Name)
+    local mapChanged=map.Name~=M._lastFixedMapName
+    if mapChanged then M._lastFixedMapName=map.Name M.lastMapName=map.Name end
+    local sx,ex=M.mapDetectXRange(map,si)
+    if mapChanged then
+        pcall(function() M.mapCleanup(map) end)
+        pcall(function() M.mapCleanupShared(si) end)
+        pcall(function() M.mapCleanupMisc() end)
+        pcall(function() M.cleanupEventMaps() end)
+        task.wait(0.1)
+        pcall(function() M.mapWidenFloors(map,si) end)
+        pcall(function() M.mapFillGaps(map,sx,ex) end)
+        pcall(function() M.mapBuildWalls(map,sx,ex) end)
+        M.Status.mapFixer="Gefixed: "..map.Name
+        if M.S.DoomTowerEnabled then task.wait(0.5) M.enableTowerDrop() end
+    end
+    pcall(function() M.mapFixCollision(map,si) end)
+end
+function M.startMapFixer()
+    if M.mapFixerThread then return end M.S.MapFixerEnabled=true M._lastFixedMapName=""
+    pcall(function() M.mapRunFix() end)
+    M.mapFixerThread=task.spawn(function()
+        while M.S.MapFixerEnabled do pcall(function() M.mapRunFix() end) M.Status.mapFixer="Actief" task.wait(MF.INT) end
+        M.Status.mapFixer="Uit" M.mapFixerThread=nil
+    end)
+end
+function M.stopMapFixer()
+    M.S.MapFixerEnabled=false
+    if M.mapFixerThread then pcall(task.cancel,M.mapFixerThread) M.mapFixerThread=nil end
+    M.Status.mapFixer="Uit"
+end
+
+print("[MzD Hub] Core v13.0 Geladen")
+
+-- ============================================
+-- [MODULE 18] GUI
+-- ============================================
+-- Cleanup oude versies
+for _, name in pairs({"MzDHubGui","MzDHubGui_v12","MzDHubGui_v13","MzDHub"}) do
+    local old=Player.PlayerGui:FindFirstChild(name) if old then old:Destroy() end
+end
+task.wait(0.1)
+
+local SCALE=M.S.GuiScale or 1.0
+local BASE_W,BASE_H=520,700
+local W=math.floor(BASE_W*SCALE) local H=math.floor(BASE_H*SCALE)
+local function s(v) return math.floor(v*SCALE) end
+
+local ScreenGui=Instance.new("ScreenGui")
+ScreenGui.Name="MzDHubGui_v13" ScreenGui.ResetOnSpawn=false ScreenGui.ZIndexBehavior=Enum.ZIndexBehavior.Sibling
+ScreenGui.Parent=Player.PlayerGui
+
+local MainFrame=Instance.new("Frame")
+MainFrame.Name="MainFrame" MainFrame.Size=UDim2.new(0,W,0,H)
+MainFrame.Position=UDim2.new(0.5,-W/2,0.5,-H/2)
+MainFrame.BackgroundColor3=Color3.fromRGB(18,18,28) MainFrame.BorderSizePixel=0
+MainFrame.Active=true MainFrame.Draggable=true MainFrame.Parent=ScreenGui
+Instance.new("UICorner",MainFrame).CornerRadius=UDim.new(0,s(10))
+
+-- Top bar
+local TopBar=Instance.new("Frame") TopBar.Name="TopBar"
+TopBar.Size=UDim2.new(1,0,0,s(40)) TopBar.Position=UDim2.new(0,0,0,0)
+TopBar.BackgroundColor3=Color3.fromRGB(30,30,50) TopBar.BorderSizePixel=0 TopBar.Parent=MainFrame
+Instance.new("UICorner",TopBar).CornerRadius=UDim.new(0,s(10))
+
+local TitleLabel=Instance.new("TextLabel") TitleLabel.Size=UDim2.new(0.75,0,1,0)
+TitleLabel.Position=UDim2.new(0,s(12),0,0) TitleLabel.BackgroundTransparency=1
+TitleLabel.Text="MzD Hub  v13.0" TitleLabel.TextColor3=Color3.fromRGB(255,215,0)
+TitleLabel.TextSize=s(16) TitleLabel.Font=Enum.Font.GothamBold TitleLabel.TextXAlignment=Enum.TextXAlignment.Left
+TitleLabel.Parent=TopBar
+
+local CloseBtn=Instance.new("TextButton") CloseBtn.Size=UDim2.new(0,s(28),0,s(28))
+CloseBtn.Position=UDim2.new(1,-s(34),0.5,-s(14)) CloseBtn.BackgroundColor3=Color3.fromRGB(200,50,50)
+CloseBtn.Text="✕" CloseBtn.TextColor3=Color3.white CloseBtn.TextSize=s(14) CloseBtn.Font=Enum.Font.GothamBold CloseBtn.Parent=TopBar
+Instance.new("UICorner",CloseBtn).CornerRadius=UDim.new(0,s(6))
+CloseBtn.MouseButton1Click:Connect(function() MainFrame.Visible=not MainFrame.Visible end)
+
+local MinBtn=Instance.new("TextButton") MinBtn.Size=UDim2.new(0,s(28),0,s(28))
+MinBtn.Position=UDim2.new(1,-s(68),0.5,-s(14)) MinBtn.BackgroundColor3=Color3.fromRGB(60,120,200)
+MinBtn.Text="—" MinBtn.TextColor3=Color3.white MinBtn.TextSize=s(14) MinBtn.Font=Enum.Font.GothamBold MinBtn.Parent=TopBar
+Instance.new("UICorner",MinBtn).CornerRadius=UDim.new(0,s(6))
+
+local _minimized=false
+local ContentArea=Instance.new("Frame") ContentArea.Name="ContentArea"
+ContentArea.Size=UDim2.new(1,0,1,-s(40)) ContentArea.Position=UDim2.new(0,0,0,s(40))
+ContentArea.BackgroundTransparency=1 ContentArea.ClipsDescendants=true ContentArea.Parent=MainFrame
+MinBtn.MouseButton1Click:Connect(function()
+    _minimized=not _minimized
+    ContentArea.Visible=not _minimized
+    MainFrame.Size=_minimized and UDim2.new(0,W,0,s(40)) or UDim2.new(0,W,0,H)
+    MinBtn.Text=_minimized and "□" or "—"
+end)
+
+-- Tab buttons
+local TABS={"Farm","Factory","Events","God","Config"}
+local TAB_COLORS={
+    Farm=Color3.fromRGB(40,160,80), Factory=Color3.fromRGB(40,100,180),
+    Events=Color3.fromRGB(180,60,160), God=Color3.fromRGB(200,80,40), Config=Color3.fromRGB(80,80,80)
+}
+local TabBar=Instance.new("Frame") TabBar.Size=UDim2.new(1,0,0,s(36))
+TabBar.Position=UDim2.new(0,0,0,0) TabBar.BackgroundTransparency=1 TabBar.Parent=ContentArea
+local TabLayout=Instance.new("UIListLayout") TabLayout.FillDirection=Enum.FillDirection.Horizontal
+TabLayout.HorizontalAlignment=Enum.HorizontalAlignment.Center TabLayout.Padding=UDim.new(0,s(3)) TabLayout.Parent=TabBar
+TabLayout.VerticalAlignment=Enum.VerticalAlignment.Center
+
+local TabPages={}
+local TabButtons={}
+local _activeTab="Farm"
+
+local function switchTab(name)
+    _activeTab=name
+    for t,page in pairs(TabPages) do page.Visible=(t==name) end
+    for t,btn in pairs(TabButtons) do
+        if t==name then btn.BackgroundColor3=TAB_COLORS[t] btn.TextColor3=Color3.white
+        else btn.BackgroundColor3=Color3.fromRGB(35,35,55) btn.TextColor3=Color3.fromRGB(160,160,160) end
+    end
+end
+
+for _, tabName in pairs(TABS) do
+    local btn=Instance.new("TextButton") btn.Size=UDim2.new(0,s(82),0,s(28))
+    btn.BackgroundColor3=Color3.fromRGB(35,35,55) btn.Text=tabName
+    btn.TextColor3=Color3.fromRGB(160,160,160) btn.TextSize=s(12) btn.Font=Enum.Font.GothamBold btn.Parent=TabBar
+    Instance.new("UICorner",btn).CornerRadius=UDim.new(0,s(6))
+    TabButtons[tabName]=btn
+    local page=Instance.new("ScrollingFrame") page.Name=tabName.."Page"
+    page.Size=UDim2.new(1,0,1,-s(40)) page.Position=UDim2.new(0,0,0,s(40))
+    page.BackgroundTransparency=1 page.ScrollBarThickness=s(4)
+    page.ScrollBarImageColor3=Color3.fromRGB(100,100,160) page.BorderSizePixel=0
+    page.Visible=false page.Parent=ContentArea
+    local layout=Instance.new("UIListLayout") layout.Padding=UDim.new(0,s(5))
+    layout.HorizontalAlignment=Enum.HorizontalAlignment.Center layout.Parent=page
+    layout.SortOrder=Enum.SortOrder.LayoutOrder
+    local pad=Instance.new("UIPadding") pad.PaddingTop=UDim.new(0,s(6)) pad.PaddingBottom=UDim.new(0,s(10)) pad.Parent=page
+    layout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
+        page.CanvasSize=UDim2.new(0,0,0,layout.AbsoluteContentSize.Y+s(20))
+    end)
+    TabPages[tabName]=page
+    btn.MouseButton1Click:Connect(function() switchTab(tabName) end)
+end
+switchTab("Farm")
+
+-- ============================================
+-- GUI HELPERS
+-- ============================================
+local function makeSection(parent,title,color)
+    local f=Instance.new("Frame") f.Size=UDim2.new(0,W-s(20),0,s(30))
+    f.BackgroundColor3=color or Color3.fromRGB(30,30,50) f.BorderSizePixel=0 f.Parent=parent
+    Instance.new("UICorner",f).CornerRadius=UDim.new(0,s(6))
+    local t=Instance.new("TextLabel") t.Size=UDim2.new(1,0,1,0) t.BackgroundTransparency=1
+    t.Text=title t.TextColor3=Color3.fromRGB(200,200,200) t.TextSize=s(12) t.Font=Enum.Font.GothamBold
+    t.TextXAlignment=Enum.TextXAlignment.Left t.Parent=f
+    local pad=Instance.new("UIPadding") pad.PaddingLeft=UDim.new(0,s(10)) pad.Parent=f
+    return f
+end
+
+local function makeToggleBtn(parent,label,onColor,onToggle)
+    local row=Instance.new("Frame") row.Size=UDim2.new(0,W-s(20),0,s(38))
+    row.BackgroundColor3=Color3.fromRGB(25,25,40) row.BorderSizePixel=0 row.Parent=parent
+    Instance.new("UICorner",row).CornerRadius=UDim.new(0,s(6))
+    local lbl=Instance.new("TextLabel") lbl.Size=UDim2.new(0.62,0,1,0) lbl.Position=UDim2.new(0,s(10),0,0)
+    lbl.BackgroundTransparency=1 lbl.Text=label lbl.TextColor3=Color3.fromRGB(220,220,220)
+    lbl.TextSize=s(12) lbl.Font=Enum.Font.Gotham lbl.TextXAlignment=Enum.TextXAlignment.Left lbl.Parent=row
+    local btn=Instance.new("TextButton") btn.Size=UDim2.new(0,s(72),0,s(26))
+    btn.Position=UDim2.new(1,-s(82),0.5,-s(13)) btn.BackgroundColor3=Color3.fromRGB(60,60,80)
+    btn.Text="UIT" btn.TextColor3=Color3.fromRGB(180,180,180) btn.TextSize=s(11) btn.Font=Enum.Font.GothamBold btn.Parent=row
+    Instance.new("UICorner",btn).CornerRadius=UDim.new(0,s(4))
+    local _on=false
+    local function upd()
+        if _on then btn.BackgroundColor3=onColor btn.Text="AAN" btn.TextColor3=Color3.white
+        else btn.BackgroundColor3=Color3.fromRGB(60,60,80) btn.Text="UIT" btn.TextColor3=Color3.fromRGB(180,180,180) end
+    end
+    btn.MouseButton1Click:Connect(function() _on=not _on upd() onToggle(_on) end)
+    return row,btn,function(v) _on=v upd() end
+end
+
+local function makeStatusRow(parent,label)
+    local row=Instance.new("Frame") row.Size=UDim2.new(0,W-s(20),0,s(28))
+    row.BackgroundColor3=Color3.fromRGB(20,20,35) row.BorderSizePixel=0 row.Parent=parent
+    Instance.new("UICorner",row).CornerRadius=UDim.new(0,s(6))
+    local lbl=Instance.new("TextLabel") lbl.Size=UDim2.new(0.35,0,1,0) lbl.Position=UDim2.new(0,s(8),0,0)
+    lbl.BackgroundTransparency=1 lbl.Text=label lbl.TextColor3=Color3.fromRGB(160,160,160)
+    lbl.TextSize=s(11) lbl.Font=Enum.Font.Gotham lbl.TextXAlignment=Enum.TextXAlignment.Left lbl.Parent=row
+    local val=Instance.new("TextLabel") val.Size=UDim2.new(0.62,0,1,0) val.Position=UDim2.new(0.36,0,0,0)
+    val.BackgroundTransparency=1 val.Text="--" val.TextColor3=Color3.fromRGB(255,215,0)
+    val.TextSize=s(11) val.Font=Enum.Font.Gotham val.TextXAlignment=Enum.TextXAlignment.Left val.Parent=row
+    return val
+end
+
+local function makeSliderRow(parent,label,minV,maxV,step,initial,onChange)
+    local row=Instance.new("Frame") row.Size=UDim2.new(0,W-s(20),0,s(48))
+    row.BackgroundColor3=Color3.fromRGB(25,25,40) row.BorderSizePixel=0 row.Parent=parent
+    Instance.new("UICorner",row).CornerRadius=UDim.new(0,s(6))
+    local lbl=Instance.new("TextLabel") lbl.Size=UDim2.new(0.55,0,0,s(20))
+    lbl.Position=UDim2.new(0,s(10),0,s(4)) lbl.BackgroundTransparency=1 lbl.Text=label
+    lbl.TextColor3=Color3.fromRGB(220,220,220) lbl.TextSize=s(11) lbl.Font=Enum.Font.Gotham
+    lbl.TextXAlignment=Enum.TextXAlignment.Left lbl.Parent=row
+    local valLbl=Instance.new("TextLabel") valLbl.Size=UDim2.new(0.4,0,0,s(20))
+    valLbl.Position=UDim2.new(0.55,0,0,s(4)) valLbl.BackgroundTransparency=1 valLbl.Text=tostring(initial)
+    valLbl.TextColor3=Color3.fromRGB(255,215,0) valLbl.TextSize=s(11) valLbl.Font=Enum.Font.GothamBold
+    valLbl.TextXAlignment=Enum.TextXAlignment.Right valLbl.Parent=row
+    local track=Instance.new("Frame") track.Size=UDim2.new(1,-s(20),0,s(8))
+    track.Position=UDim2.new(0,s(10),0,s(30)) track.BackgroundColor3=Color3.fromRGB(50,50,70)
+    track.BorderSizePixel=0 track.Parent=row Instance.new("UICorner",track).CornerRadius=UDim.new(0,s(4))
+    local fill=Instance.new("Frame") fill.Size=UDim2.new((initial-minV)/(maxV-minV),0,1,0)
+    fill.BackgroundColor3=Color3.fromRGB(80,150,255) fill.BorderSizePixel=0 fill.Parent=track
+    Instance.new("UICorner",fill).CornerRadius=UDim.new(0,s(4))
+    local thumb=Instance.new("TextButton") thumb.Size=UDim2.new(0,s(16),0,s(16))
+    thumb.Position=UDim2.new((initial-minV)/(maxV-minV),-s(8),0.5,-s(8))
+    thumb.BackgroundColor3=Color3.fromRGB(255,215,0) thumb.Text="" thumb.Parent=track
+    Instance.new("UICorner",thumb).CornerRadius=UDim.new(0,s(8))
+    local curVal=initial local dragging=false
+    local function setVal(v)
+        v=math.clamp(math.round((v-minV)/step)*step+minV,minV,maxV)
+        curVal=v valLbl.Text=tostring(v)
+        local pct=(v-minV)/(maxV-minV)
+        fill.Size=UDim2.new(pct,0,1,0) thumb.Position=UDim2.new(pct,-s(8),0.5,-s(8))
+        onChange(v)
+    end
+    thumb.MouseButton1Down:Connect(function() dragging=true end)
+    UserInputService.InputEnded:Connect(function(i) if i.UserInputType==Enum.UserInputType.MouseButton1 then dragging=false end end)
+    UserInputService.InputChanged:Connect(function(i)
+        if dragging and i.UserInputType==Enum.UserInputType.MouseMovement then
+            local abs=track.AbsolutePosition.X local sz=track.AbsoluteSize.X
+            local pct=math.clamp((i.Position.X-abs)/sz,0,1)
+            setVal(minV+pct*(maxV-minV))
+        end
+    end)
+    track.InputBegan:Connect(function(i)
+        if i.UserInputType==Enum.UserInputType.MouseButton1 then
+            local abs=track.AbsolutePosition.X local sz=track.AbsoluteSize.X
+            local pct=math.clamp((i.Position.X-abs)/sz,0,1)
+            setVal(minV+pct*(maxV-minV))
+        end
+    end)
+    return row,valLbl,setVal
+end
+
+local function makeDropdown(parent,label,options,initial,onChange)
+    local row=Instance.new("Frame") row.Size=UDim2.new(0,W-s(20),0,s(38))
+    row.BackgroundColor3=Color3.fromRGB(25,25,40) row.BorderSizePixel=0 row.Parent=parent
+    Instance.new("UICorner",row).CornerRadius=UDim.new(0,s(6))
+    local lbl=Instance.new("TextLabel") lbl.Size=UDim2.new(0.42,0,1,0) lbl.Position=UDim2.new(0,s(10),0,0)
+    lbl.BackgroundTransparency=1 lbl.Text=label lbl.TextColor3=Color3.fromRGB(220,220,220)
+    lbl.TextSize=s(11) lbl.Font=Enum.Font.Gotham lbl.TextXAlignment=Enum.TextXAlignment.Left lbl.Parent=row
+    local btn=Instance.new("TextButton") btn.Size=UDim2.new(0,s(160),0,s(26))
+    btn.Position=UDim2.new(1,-s(170),0.5,-s(13)) btn.BackgroundColor3=Color3.fromRGB(40,40,65)
+    btn.Text=tostring(initial).." ▾" btn.TextColor3=Color3.fromRGB(255,215,0) btn.TextSize=s(11) btn.Font=Enum.Font.Gotham btn.Parent=row
+    Instance.new("UICorner",btn).CornerRadius=UDim.new(0,s(4))
+    local curVal=initial
+    local function setValue(v) curVal=v btn.Text=tostring(v).." ▾" onChange(v) end
+    local dropFrame=nil
+    btn.MouseButton1Click:Connect(function()
+        if dropFrame then dropFrame:Destroy() dropFrame=nil return end
+        dropFrame=Instance.new("Frame")
+        local dh=math.min(#options,6)*s(28)+s(6)
+        dropFrame.Size=UDim2.new(0,s(160),0,dh) dropFrame.BackgroundColor3=Color3.fromRGB(35,35,60)
+        dropFrame.BorderSizePixel=0 dropFrame.ZIndex=20 dropFrame.ClipsDescendants=true
+        local absPos=btn.AbsolutePosition local scrnSz=workspace.CurrentCamera.ViewportSize
+        local spaceBelow=scrnSz.Y-(absPos.Y+btn.AbsoluteSize.Y) local spaceAbove=absPos.Y
+        if spaceBelow>=dh or spaceBelow>=spaceAbove then dropFrame.Position=UDim2.new(0,absPos.X,0,absPos.Y+btn.AbsoluteSize.Y)
+        else dropFrame.Position=UDim2.new(0,absPos.X,0,absPos.Y-dh) end
+        dropFrame.Parent=ScreenGui
+        Instance.new("UICorner",dropFrame).CornerRadius=UDim.new(0,s(6))
+        local sf2=Instance.new("ScrollingFrame") sf2.Size=UDim2.new(1,0,1,0) sf2.BackgroundTransparency=1
+        sf2.ScrollBarThickness=s(3) sf2.BorderSizePixel=0 sf2.Parent=dropFrame
+        local ll=Instance.new("UIListLayout") ll.Parent=sf2
+        ll:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function() sf2.CanvasSize=UDim2.new(0,0,0,ll.AbsoluteContentSize.Y) end)
+        for _, opt in pairs(options) do
+            local ob=Instance.new("TextButton") ob.Size=UDim2.new(1,0,0,s(28))
+            ob.BackgroundColor3=opt==curVal and Color3.fromRGB(60,100,180) or Color3.fromRGB(35,35,60)
+            ob.Text=tostring(opt) ob.TextColor3=Color3.white ob.TextSize=s(11) ob.Font=Enum.Font.Gotham ob.Parent=sf2
+            ob.MouseButton1Click:Connect(function()
+                setValue(opt) if dropFrame then dropFrame:Destroy() dropFrame=nil end
+            end)
+        end
+    end)
+    ScreenGui.DescendantAdded:Connect(function() end)
+    UserInputService.InputBegan:Connect(function(i)
+        if i.UserInputType==Enum.UserInputType.MouseButton1 and dropFrame then
+            local mPos=i.Position
+            local dfPos=dropFrame.AbsolutePosition local dfSz=dropFrame.AbsoluteSize
+            if mPos.X<dfPos.X or mPos.X>dfPos.X+dfSz.X or mPos.Y<dfPos.Y or mPos.Y>dfPos.Y+dfSz.Y then
+                if dropFrame then dropFrame:Destroy() dropFrame=nil end
+            end
+        end
+    end)
+    return row,setValue
+end
+
+local function makeNumInput(parent,label,initial,onChange)
+    local row=Instance.new("Frame") row.Size=UDim2.new(0,W-s(20),0,s(38))
+    row.BackgroundColor3=Color3.fromRGB(25,25,40) row.BorderSizePixel=0 row.Parent=parent
+    Instance.new("UICorner",row).CornerRadius=UDim.new(0,s(6))
+    local lbl=Instance.new("TextLabel") lbl.Size=UDim2.new(0.52,0,1,0) lbl.Position=UDim2.new(0,s(10),0,0)
+    lbl.BackgroundTransparency=1 lbl.Text=label lbl.TextColor3=Color3.fromRGB(220,220,220)
+    lbl.TextSize=s(11) lbl.Font=Enum.Font.Gotham lbl.TextXAlignment=Enum.TextXAlignment.Left lbl.Parent=row
+    local dec=Instance.new("TextButton") dec.Size=UDim2.new(0,s(26),0,s(26)) dec.Position=UDim2.new(1,-s(156),0.5,-s(13))
+    dec.BackgroundColor3=Color3.fromRGB(60,60,80) dec.Text="-" dec.TextColor3=Color3.white dec.TextSize=s(14) dec.Font=Enum.Font.GothamBold dec.Parent=row
+    Instance.new("UICorner",dec).CornerRadius=UDim.new(0,s(4))
+    local inp=Instance.new("TextBox") inp.Size=UDim2.new(0,s(72),0,s(26)) inp.Position=UDim2.new(1,-s(126),0.5,-s(13))
+    inp.BackgroundColor3=Color3.fromRGB(35,35,60) inp.Text=tostring(initial) inp.TextColor3=Color3.fromRGB(255,215,0)
+    inp.TextSize=s(11) inp.Font=Enum.Font.Gotham inp.ClearTextOnFocus=false inp.Parent=row
+    Instance.new("UICorner",inp).CornerRadius=UDim.new(0,s(4))
+    local inc=Instance.new("TextButton") inc.Size=UDim2.new(0,s(26),0,s(26)) inc.Position=UDim2.new(1,-s(46),0.5,-s(13))
+    inc.BackgroundColor3=Color3.fromRGB(60,60,80) inc.Text="+" inc.TextColor3=Color3.white inc.TextSize=s(14) inc.Font=Enum.Font.GothamBold inc.Parent=row
+    Instance.new("UICorner",inc).CornerRadius=UDim.new(0,s(4))
+    local function commit() local v=tonumber(inp.Text) if v then inp.Text=tostring(v) onChange(v) end end
+    inp.FocusLost:Connect(commit)
+    dec.MouseButton1Click:Connect(function() local v=tonumber(inp.Text) or 0 inp.Text=tostring(v-1) commit() end)
+    inc.MouseButton1Click:Connect(function() local v=tonumber(inp.Text) or 0 inp.Text=tostring(v+1) commit() end)
+    return row,inp
+end
+
+-- ============================================
+-- [TAB: Farm]
+-- ============================================
+local FP=TabPages.Farm
+makeSection(FP,"⚙️  Farm Instellingen",Color3.fromRGB(30,60,40))
+makeDropdown(FP,"Modus",{"Collect, Place & Max","Collect","Place & Max"},M.S.FarmMode,function(v) M.S.FarmMode=v end)
+makeDropdown(FP,"Slot",{"1","2","3","4","5","6","7","8","9","10"},M.S.FarmSlot,function(v) M.S.FarmSlot=v end)
+
+local rarities=M.getAvailableRarities()
+makeDropdown(FP,"Rarity",rarities,type(M.S.TargetRarity)=="table" and M.S.TargetRarity[1] or M.S.TargetRarity,function(v)
+    M.S.TargetRarity={v}
+end)
+local mutations=M.getAvailableMutations()
+makeDropdown(FP,"Mutatie",mutations,M.S.TargetMutation,function(v) M.S.TargetMutation=v end)
+makeNumInput(FP,"Max Level",M.S.MaxLevel,function(v) M.S.MaxLevel=math.max(1,v) end)
+
+makeSection(FP,"🚀  Farm Controls",Color3.fromRGB(30,60,40))
+local _,_,setFarmToggle=makeToggleBtn(FP,"Auto Farm",Color3.fromRGB(40,160,80),function(on)
+    if on then M.startFarming() else M.stopFarming() end
+end)
+local _,_,setMoneyToggle=makeToggleBtn(FP,"Auto Money",Color3.fromRGB(40,130,100),function(on)
+    if on then M.startMoney() else M.stopMoney() end
+end)
+local _,_,setUpgradeToggle=makeToggleBtn(FP,"Auto Upgrade",Color3.fromRGB(40,100,180),function(on)
+    if on then M.startAutoUpgrade() else M.stopAutoUpgrade() end
+end)
+local _,_,setAFKToggle=makeToggleBtn(FP,"Anti AFK",Color3.fromRGB(100,80,180),function(on)
+    if on then M.startAFK() else M.stopAFK() end
+end)
+local _,_,setInstantToggle=makeToggleBtn(FP,"Instant Pickup",Color3.fromRGB(60,150,120),function(on)
+    M.S.InstantPickup=on if on then M.setupInstant() end
+end)
+setInstantToggle(true)
+
+makeSection(FP,"📊  Status",Color3.fromRGB(20,30,20))
+local farmStat=makeStatusRow(FP,"Farm:")
+local moneyStat=makeStatusRow(FP,"Money:")
+local upgradeStat=makeStatusRow(FP,"Upgrade:")
+
+-- ============================================
+-- [TAB: Factory]
+-- ============================================
+local FCP=TabPages.Factory
+makeSection(FCP,"🏭  Factory Instellingen",Color3.fromRGB(30,50,80))
+makeDropdown(FCP,"Rarity",rarities,M.S.FactoryRarity,function(v) M.S.FactoryRarity=v end)
+makeDropdown(FCP,"Mutatie",mutations,M.S.FactoryMutation,function(v) M.S.FactoryMutation=v end)
+makeDropdown(FCP,"Slot",{"1","2","3","4","5","6","7","8","9","10"},M.S.FactorySlot,function(v) M.S.FactorySlot=v end)
+makeNumInput(FCP,"Max Level",M.S.FactoryMaxLevel,function(v) M.S.FactoryMaxLevel=math.max(1,v) end)
+
+makeSection(FCP,"🚀  Factory Controls",Color3.fromRGB(30,50,80))
+local _,_,setFactoryToggle=makeToggleBtn(FCP,"Auto Factory",Color3.fromRGB(40,100,180),function(on)
+    if on then M.startFactoryLoop() else M.stopFactoryLoop() end
+end)
+makeSection(FCP,"📊  Status",Color3.fromRGB(20,25,40))
+local factoryStat=makeStatusRow(FCP,"Factory:")
+local factoryCountStat=makeStatusRow(FCP,"Klaar:")
+
+-- ============================================
+-- [TAB: Events]
+-- ============================================
+local EP=TabPages.Events
+makeSection(EP,"💝  Valentine / Candy",Color3.fromRGB(80,25,50))
+local _,_,setValToggle=makeToggleBtn(EP,"Auto Valentine",Color3.fromRGB(200,80,120),function(on)
+    if on then M.startValentine() else M.stopValentine() end
+end)
+makeSection(EP,"📊  Valentine Status",Color3.fromRGB(50,20,35))
+local valStat=makeStatusRow(EP,"Status:")
+local valCountStat=makeStatusRow(EP,"Submits:")
+
+makeSection(EP,"🎮  Arcade Event",Color3.fromRGB(40,40,100))
+local _,_,setArcadeToggle=makeToggleBtn(EP,"Auto Arcade",Color3.fromRGB(80,80,200),function(on)
+    if on then M.startArcade() else M.stopArcade() end
+end)
+local arcadeStat=makeStatusRow(EP,"Arcade:")
+
+makeSection(EP,"☠️  Doom Coins",Color3.fromRGB(80,20,20))
+local _,_,setDoomToggle=makeToggleBtn(EP,"Auto Doom Coins",Color3.fromRGB(200,60,30),function(on)
+    if on then M.startDoomCollector() else M.stopDoomCollector() end
+end)
+local _,_,setTowerToggle=makeToggleBtn(EP,"Tower Drop",Color3.fromRGB(160,60,20),function(on)
+    if on then M.enableTowerDrop() else M.disableTowerDrop() end
+end)
+makeSliderRow(EP,"Tower Offset",  -20,20,1,0,function(v) M.S.DoomTowerOffset=v if M.S.DoomTowerEnabled then M.enableTowerDrop() end end)
+makeSection(EP,"📊  Doom Status",Color3.fromRGB(50,15,15))
+local doomStat=makeStatusRow(EP,"Doom:")
+local doomTowerStat=makeStatusRow(EP,"Tower:")
+
+makeSection(EP,"🍀  Lucky Blocks",Color3.fromRGB(30,60,30))
+makeDropdown(EP,"Rarity",rarities,type(M.S.LuckyBlockRarity)=="table" and M.S.LuckyBlockRarity[1] or "Common",function(v) M.S.LuckyBlockRarity={v} end)
+makeDropdown(EP,"Mutatie",mutations,M.S.LuckyBlockMutation,function(v) M.S.LuckyBlockMutation=v end)
+local _,_,setLBToggle=makeToggleBtn(EP,"Auto Lucky Block",Color3.fromRGB(60,160,60),function(on)
+    if on then M.startLuckyBlockFarm() else M.stopLuckyBlockFarm() end
+end)
+local lbStat=makeStatusRow(EP,"Lucky Block:")
+
+-- ============================================
+-- [TAB: God]
+-- ============================================
+local GP=TabPages.God
+makeSection(GP,"👑  God Mode",Color3.fromRGB(80,40,20))
+local _,_,setGodToggle=makeToggleBtn(GP,"God Mode",Color3.fromRGB(220,100,40),function(on)
+    if on then M.enableGod() else M.disableGod() end
+end)
+makeSliderRow(GP,"Walk Y",  -50,50,1,M.S.GodWalkY, function(v) M.S.GodWalkY=v end)
+makeSliderRow(GP,"Floor Y", -50,10,1,M.S.GodFloorY,function(v)
+    M.S.GodFloorY=v
+    if M._isGod then
+        local map=M.mapFindCurrentMap()
+        if map then pcall(function() local si=M.mapFindShared(map.Name) godBuildEgaleVloer(map) end) end
+    end
+end)
+
+makeSection(GP,"🗺️  Map Fixer",Color3.fromRGB(50,50,20))
+local _,_,setMapToggle=makeToggleBtn(GP,"Map Fixer",Color3.fromRGB(160,140,40),function(on)
+    if on then M.startMapFixer() else M.stopMapFixer() end
+end)
+makeDropdown(GP,"Muur Thema",{"Auto","Dark","Doom","Valentine","UFO","Bright"},M.S.WallTheme,function(v)
+    M.S.WallTheme=v
+    if M._isGod then pcall(function()
+        local map=M.mapFindCurrentMap()
+        if map then local sx,ex=M.mapDetectXRange(map,M.mapFindShared(map.Name)) M.mapBuildWalls(map,sx,ex) end
+    end) end
+end)
+makeSection(GP,"📊  God Status",Color3.fromRGB(50,30,15))
+local godStat=makeStatusRow(GP,"God:")
+local mapStat=makeStatusRow(GP,"Map Fixer:")
+
+makeSection(GP,"🏰  Navigatie",Color3.fromRGB(30,40,30))
+local navRow=Instance.new("Frame") navRow.Size=UDim2.new(0,W-s(20),0,s(38))
+navRow.BackgroundTransparency=1 navRow.Parent=GP
+local ll2=Instance.new("UIListLayout") ll2.FillDirection=Enum.FillDirection.Horizontal
+ll2.HorizontalAlignment=Enum.HorizontalAlignment.Center ll2.Padding=UDim.new(0,s(6)) ll2.Parent=navRow
+ll2.VerticalAlignment=Enum.VerticalAlignment.Center
+
+local function makeSmallBtn(parent,txt,color,cb)
+    local b=Instance.new("TextButton") b.Size=UDim2.new(0,s(110),0,s(30))
+    b.BackgroundColor3=color b.Text=txt b.TextColor3=Color3.white b.TextSize=s(11) b.Font=Enum.Font.GothamBold b.Parent=parent
+    Instance.new("UICorner",b).CornerRadius=UDim.new(0,s(6))
+    b.MouseButton1Click:Connect(cb) return b
+end
+
+makeSmallBtn(navRow,"🏠 Naar Base",Color3.fromRGB(60,100,60),function() task.spawn(function() M.safeReturnToBase() end) end)
+makeSmallBtn(navRow,"📍 Set Home",Color3.fromRGB(60,80,130),function() M.setHomePosition() end)
+makeSmallBtn(navRow,"🔍 Find Base",Color3.fromRGB(80,60,100),function() M.findBase() end)
+
+-- ============================================
+-- [TAB: Config]
+-- ============================================
+local CFP=TabPages.Config
+makeSection(CFP,"⚙️  Snelheid",Color3.fromRGB(40,40,60))
+makeSliderRow(CFP,"Tween Speed",1000,99999,500,M.S.TweenSpeed,function(v) M.S.TweenSpeed=v end)
+makeSliderRow(CFP,"Corridor Speed",100,5000,100,M.S.CorridorSpeed,function(v) M.S.CorridorSpeed=v end)
+
+makeSection(CFP,"🖥️  Interface",Color3.fromRGB(40,40,60))
+makeSliderRow(CFP,"GUI Schaal %",50,150,10,math.floor(SCALE*100),function(v)
+    M.S.GuiScale=v/100
+end)
+
+makeSection(CFP,"📋  Info",Color3.fromRGB(30,30,50))
+local infoLabels={
+    "MzD Hub v13.0",
+    "Optimalisaties:",
+    "✅ Nil-checks overal",
+    "✅ Local service lookups",
+    "✅ Valentine+Candy samengevoegd",
+    "✅ Modulaire structuur",
+    "✅ Error-tolerant (pcall overal)",
+}
+for _, txt in pairs(infoLabels) do
+    local lbl=Instance.new("TextLabel") lbl.Size=UDim2.new(0,W-s(20),0,s(22))
+    lbl.BackgroundTransparency=1 lbl.Text=txt lbl.TextColor3=Color3.fromRGB(180,180,180)
+    lbl.TextSize=s(11) lbl.Font=Enum.Font.Gotham lbl.TextXAlignment=Enum.TextXAlignment.Left lbl.Parent=CFP
+    local pad=Instance.new("UIPadding") pad.PaddingLeft=UDim.new(0,s(14)) pad.Parent=lbl
+end
+
+-- ============================================
+-- [MODULE 19] STATUS UPDATE LOOP
+-- ============================================
+task.spawn(function()
+    while Player and Player.Parent do
+        pcall(function()
+            farmStat.Text=M.Status.farm.."  (#"..M.Status.farmCount..")"
+            moneyStat.Text=M.Status.money
+            upgradeStat.Text=M.Status.upgrade
+            factoryStat.Text=M.Status.factory
+            factoryCountStat.Text=tostring(M.Status.factoryCount)
+            valStat.Text=M.Status.valentine
+            valCountStat.Text=tostring(M.Status.valentineCount)
+            arcadeStat.Text=M.Status.arcade.."  (#"..M.Status.arcadeCount..")"
+            doomStat.Text=M.Status.doom
+            doomTowerStat.Text=M.Status.doomTower
+            lbStat.Text=M.Status.luckyBlock.."  (#"..M.Status.luckyBlockCount..")"
+            godStat.Text=M.Status.god
+            mapStat.Text=M.Status.mapFixer
+        end)
+        task.wait(0.5)
+    end
+end)
+
+-- Toggle met keybind: RightShift toont/verbergt GUI
+UserInputService.InputBegan:Connect(function(input,gameProcessed)
+    if not gameProcessed and input.KeyCode==Enum.KeyCode.RightShift then
+        MainFrame.Visible=not MainFrame.Visible
+    end
+end)
+
+print("[MzD Hub] v13.0 GUI Geladen — RightShift om te tonen/verbergen")
