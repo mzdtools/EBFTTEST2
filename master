@@ -1,12 +1,14 @@
 -- ============================================
--- MzD Hub v12.5 — GEOPTIMALISEERD
--- Wijzigingen t.o.v. origineel:
---   1. Alle game-services lokaal gecached (geen global lookup per call)
---   2. Kritieke pcall-wrappers toegevoegd (remote paden, PlotAction)
---   3. Duplicate helper-logica samengevoegd
---   4. Duidelijke sectie-headers (modulair in één bestand)
---   5. Redundante loops/scans gededupliceerd
---   6. string.* / math.* / table.* gecached als locals
+-- MzD Hub v13.0 — GEOPTIMALISEERD + TOWER TRIAL FARM
+-- Wijzigingen t.o.v. v12.5:
+--   1. BUG FIX: isMzDPart → p.Name == "MzDGodPreview" (was p == "MzDGodPreview")
+--   2. FACTORY FIX: Pakt ALLE brainrots uit backpack van de geselecteerde rarity
+--      en maxed ze zo snel mogelijk (geen move, direct place+upgrade+pickup rinse repeat)
+--   3. Tower Mover VERWIJDERD (was redundant, conflicteerde)
+--   4. Tower Trial Farm GEÏNTEGREERD in Farm Tab
+--   5. Auto Doom Coins conflict-fix: eigen Heartbeat-conn, geen overlap met anderen
+--   6. GUI Scale slider werkend
+--   7. Services/stdlib volledig lokaal gecached
 -- ============================================
 -- loadstring(game:HttpGet("https://raw.githubusercontent.com/mzdtools/EBFTTEST/main/Tsunami"))()
 -- ============================================
@@ -18,15 +20,13 @@
 getgenv().MzD = {}
 local M = getgenv().MzD
 
--- Services lokaal cachen: voorkomt global lookup overhead bij elke aanroep
-local Players          = game:GetService("Players")
-local TweenService     = game:GetService("TweenService")
-local RunService       = game:GetService("RunService")
-local UserInputService = game:GetService("UserInputService")
+local Players           = game:GetService("Players")
+local TweenService      = game:GetService("TweenService")
+local RunService        = game:GetService("RunService")
+local UserInputService  = game:GetService("UserInputService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local Player           = Players.LocalPlayer
+local Player            = Players.LocalPlayer
 
--- Stdlib locals: LuaVM hoeft niet elke keer via global table te zoeken
 local tinsert  = table.insert
 local tremove  = table.remove
 local tsort    = table.sort
@@ -47,7 +47,7 @@ local tcancel  = task.cancel
 -- [MODULE 2] WORKSPACE INIT
 -- ============================================
 
-M.ActiveBrainrots  = workspace:FindFirstChild("ActiveBrainrots")
+M.ActiveBrainrots   = workspace:FindFirstChild("ActiveBrainrots")
 M.ActiveLuckyBlocks = workspace:FindFirstChild("ActiveLuckyBlocks")
 
 if not M.ActiveBrainrots then
@@ -62,15 +62,12 @@ if not M.ActiveLuckyBlocks then
 end
 
 -- ============================================
--- [MODULE 3] REMOTE DISCOVERY (met pcall-hardening)
+-- [MODULE 3] REMOTE DISCOVERY
 -- ============================================
--- KRITIEK: RemoteFunction-paden kunnen veranderen bij een Roblox update.
--- Beide fallback-paden worden geprobeerd. Geen van beide mag het script crashen.
 
 M.PlotAction = nil
 
 local function findPlotAction()
-    -- Pad 1: Shared/Remotes/Networking
     local ok1, result1 = pcall(function()
         return ReplicatedStorage
             :WaitForChild("Shared", 10)
@@ -80,7 +77,6 @@ local function findPlotAction()
     end)
     if ok1 and result1 then return result1 end
 
-    -- Pad 2: Packages/Net
     local ok2, result2 = pcall(function()
         return ReplicatedStorage
             :WaitForChild("Packages", 10)
@@ -127,81 +123,78 @@ M.S = {
     GodWalkY           = 0,
     GodFloorY          = -10,
     DoomEnabled        = false,
-    DoomTowerEnabled   = false,
-    DoomTowerOffset    = 0,
     WallTheme          = "Auto",
     GuiScale           = 1.0,
+    -- Tower Trial
+    TowerTrialEnabled  = false,
+    TowerTrialSlot     = "5",
+    TowerTrialFallbackCd = 305,
 }
 
 M.Status = {
-    farm          = "Idle", farmCount    = 0,
-    money         = "Idle",
-    afk           = "Uit",
-    placeCount    = 0,     upgradeCount  = 0,
-    upgrade       = "Idle",
-    factory       = "Idle", factoryCount = 0,
-    valentine     = "Idle", valentineCount = 0,
-    arcade        = "Idle", arcadeCount  = 0,
-    mapFixer      = "Uit",
-    luckyBlock    = "Idle", luckyBlockCount = 0,
-    god           = "Uit",
-    doom          = "Uit",  doomCount    = 0,
-    doomTower     = "Uit",
+    farm           = "Idle", farmCount     = 0,
+    money          = "Idle",
+    afk            = "Uit",
+    placeCount     = 0,     upgradeCount   = 0,
+    upgrade        = "Idle",
+    factory        = "Idle", factoryCount  = 0,
+    valentine      = "Idle", valentineCount = 0,
+    arcade         = "Idle", arcadeCount   = 0,
+    mapFixer       = "Uit",
+    luckyBlock     = "Idle", luckyBlockCount = 0,
+    god            = "Uit",
+    doom           = "Uit",  doomCount     = 0,
+    towerTrial     = "Idle", towerTrialCount = 0,
 }
 
 -- ============================================
 -- [MODULE 5] STATE / THREAD HANDLES
 -- ============================================
 
-M.baseGUID         = nil
-M.baseCFrame       = nil
-M.homePosition     = nil
-M.farmThread       = nil
-M.factoryThread    = nil
-M.moneyThread      = nil
-M.moneyRemoteThread = nil
-M.afkThread        = nil
-M._afkSteppedConn  = nil
-M._instantConn     = nil
-M.upgradeThread    = nil
-M.valentineThread  = nil
-M.valentineCollectorConn   = nil
-M._valentineDescAddedConn  = nil
-M._candyCollectorConn      = nil
-M._candyDescAddedConn      = nil
-M._candyCachedParts        = {}
-M._candyLastCacheScan      = 0
-M.arcadeThread     = nil
-M.mapFixerThread   = nil
-M.lastMapName      = ""
-M._valentineCachedParts    = {}
-M._valentineLastCacheScan  = 0
-M._valentineStationCF      = nil
-M.luckyBlockThread = nil
-M._isGod           = false
-M._godLoopThread   = nil
-M._godHealthConn   = nil
-M._godDiedConn     = nil
-M._godOriginalFloors  = {}
-M._godCreatedParts    = {}
-M._godKillParts       = {}
-M._godKillWatchThread = nil
-M._godFloorCacheTime  = 0
-M._towerMoved         = false
-M._towerOriginalCF    = nil
-M._towerOriginalY     = nil
-M._towerWatchThread   = nil
-M._towerLastTargetY   = nil
-M._towerDetectedFloorY = nil
-M._towerDetectedSource = nil
-M._doomConn        = nil
-M._doomDescConn    = nil
-M._doomTowerDescConn = nil
-M._doomCachedParts = {}
-M._doomLastScan    = 0
-M._doomCollected   = 0
-M._wallZ_front     = 207
-M._wallZ_back      = -207
+M.baseGUID              = nil
+M.baseCFrame            = nil
+M.homePosition          = nil
+M.farmThread            = nil
+M.factoryThread         = nil
+M.moneyThread           = nil
+M.moneyRemoteThread     = nil
+M.afkThread             = nil
+M._afkSteppedConn       = nil
+M._instantConn          = nil
+M.upgradeThread         = nil
+M.valentineThread       = nil
+M.valentineCollectorConn  = nil
+M._valentineDescAddedConn = nil
+M._candyCollectorConn     = nil
+M._candyDescAddedConn     = nil
+M._candyCachedParts       = {}
+M._candyLastCacheScan     = 0
+M.arcadeThread          = nil
+M.mapFixerThread        = nil
+M.lastMapName           = ""
+M._valentineCachedParts   = {}
+M._valentineLastCacheScan = 0
+M._valentineStationCF     = nil
+M.luckyBlockThread      = nil
+M._isGod                = false
+M._godLoopThread        = nil
+M._godHealthConn        = nil
+M._godDiedConn          = nil
+M._godOriginalFloors    = {}
+M._godCreatedParts      = {}
+M._godKillParts         = {}
+M._godKillWatchThread   = nil
+M._godFloorCacheTime    = 0
+M._doomConn             = nil
+M._doomDescConn         = nil
+M._doomCachedParts      = {}
+M._doomLastScan         = 0
+M._doomCollected        = 0
+M._wallZ_front          = 207
+M._wallZ_back           = -207
+-- Tower Trial state
+M._towerTrialThread     = nil
+M._towerTrialEnabled    = false
 
 local HIGH_RARITIES = {["Celestial"]=true, ["Divine"]=true, ["Infinity"]=true}
 
@@ -210,21 +203,21 @@ local HIGH_RARITIES = {["Celestial"]=true, ["Divine"]=true, ["Infinity"]=true}
 -- ============================================
 
 local WALL_THEMES = {
-    Dark      = { wall=Color3.fromRGB(20,20,30),   floor=Color3.fromRGB(15,15,20),   stripe=Color3.fromRGB(255,200,50),  glow=Color3.fromRGB(255,215,0)   },
-    Doom      = { wall=Color3.fromRGB(60,10,10),   floor=Color3.fromRGB(40,5,5),     stripe=Color3.fromRGB(255,60,0),   glow=Color3.fromRGB(255,80,20)   },
-    Valentine = { wall=Color3.fromRGB(80,20,40),   floor=Color3.fromRGB(60,15,30),   stripe=Color3.fromRGB(255,100,150),glow=Color3.fromRGB(255,130,180) },
-    UFO       = { wall=Color3.fromRGB(10,40,10),   floor=Color3.fromRGB(5,30,5),     stripe=Color3.fromRGB(0,255,80),   glow=Color3.fromRGB(50,255,100)  },
-    Bright    = { wall=Color3.fromRGB(200,200,210), floor=Color3.fromRGB(180,180,190),stripe=Color3.fromRGB(50,50,200), glow=Color3.fromRGB(80,80,255)   },
+    Dark      = { wall=Color3.fromRGB(20,20,30),    floor=Color3.fromRGB(15,15,20),    stripe=Color3.fromRGB(255,200,50),   glow=Color3.fromRGB(255,215,0)   },
+    Doom      = { wall=Color3.fromRGB(60,10,10),    floor=Color3.fromRGB(40,5,5),      stripe=Color3.fromRGB(255,60,0),    glow=Color3.fromRGB(255,80,20)   },
+    Valentine = { wall=Color3.fromRGB(80,20,40),    floor=Color3.fromRGB(60,15,30),    stripe=Color3.fromRGB(255,100,150), glow=Color3.fromRGB(255,130,180) },
+    UFO       = { wall=Color3.fromRGB(10,40,10),    floor=Color3.fromRGB(5,30,5),      stripe=Color3.fromRGB(0,255,80),    glow=Color3.fromRGB(50,255,100)  },
+    Bright    = { wall=Color3.fromRGB(200,200,210), floor=Color3.fromRGB(180,180,190), stripe=Color3.fromRGB(50,50,200),   glow=Color3.fromRGB(80,80,255)   },
 }
 
 local function getThemeColors()
     local theme = M.S.WallTheme or "Dark"
     if theme == "Auto" then
         local mapName = slower(M.lastMapName or "")
-        if sfind(mapName, "doom")                          then return WALL_THEMES.Doom
-        elseif sfind(mapName, "valentine") or sfind(mapName,"candy") then return WALL_THEMES.Valentine
-        elseif sfind(mapName, "ufo") or sfind(mapName,"radioactive") then return WALL_THEMES.UFO
-        elseif sfind(mapName, "bright") or sfind(mapName,"white")    then return WALL_THEMES.Bright
+        if sfind(mapName,"doom")                                  then return WALL_THEMES.Doom
+        elseif sfind(mapName,"valentine") or sfind(mapName,"candy") then return WALL_THEMES.Valentine
+        elseif sfind(mapName,"ufo") or sfind(mapName,"radioactive") then return WALL_THEMES.UFO
+        elseif sfind(mapName,"bright") or sfind(mapName,"white")    then return WALL_THEMES.Bright
         else return WALL_THEMES.Dark end
     end
     return WALL_THEMES[theme] or WALL_THEMES.Dark
@@ -234,26 +227,24 @@ end
 -- [MODULE 7] UTILITY HELPERS
 -- ============================================
 
--- Controleert of een BasePart door MzD Hub zelf aangemaakt is
+-- BUG FIX: was `p == "MzDGodPreview"` (altijd false), nu `p.Name == "MzDGodPreview"`
 local function isMzDPart(obj)
     if not obj or not obj:IsA("BasePart") then return false end
     local n = obj.Name
     if n == "MzDGodFloor" or n == "MzDGodCatchFloor" or n == "MzDGodFloorStripe" then return true end
     local p = obj.Parent
     while p do
-        if p.Name == "MzDHubWalls" or p == "MzDGodPreview" then return true end
+        if p.Name == "MzDHubWalls" or p.Name == "MzDGodPreview" then return true end
         p = p.Parent
     end
     return false
 end
 
--- Gecentraliseerde PlotAction invoker met throttle + pcall
--- KRITIEK: Elke remote-call kan falen na een game-update → altijd pcall
 local _lastPlotCall = 0
 local PLOT_COOLDOWN = 0.15
 
 local function throttledPlotAction(action, guid, slot)
-    local now = tick()
+    local now  = tick()
     local wait = PLOT_COOLDOWN - (now - _lastPlotCall)
     if wait > 0 then twait(wait) end
     _lastPlotCall = tick()
@@ -326,229 +317,12 @@ end
 tspawn(function() twait(3) M.findBase() end)
 
 -- ============================================
--- [MODULE 9] TOWER MOVER
+-- [MODULE 9] DOOM EVENT COLLECTOR
+-- Geen Tower Mover meer — die was verwijderd.
+-- Doom collector heeft eigen _doomConn zodat hij
+-- NOOIT conflicteert met Valentine/Arcade/etc.
 -- ============================================
 
--- GEDEDUPLICEERD: findTower was ook lokaal gedefinieerd in doom-sectie; nu één versie
-local function findTower()
-    local ok, tower = pcall(function()
-        return workspace.GameObjects.PlaceSpecific.root.Tower
-    end)
-    if ok and tower then return tower end
-    for _, c in pairs(workspace:GetDescendants()) do
-        if c.Name == "Tower" and c:IsA("Model") then
-            local cnt = 0
-            for _, d in pairs(c:GetDescendants()) do
-                if d:IsA("BasePart") then cnt += 1 end
-                if cnt > 5 then return c end
-            end
-        end
-    end
-    return nil
-end
-
-local function getTowerY()
-    local tower = findTower() if not tower then return nil end
-    local ok, pivot = pcall(function() return tower:GetPivot() end)
-    if ok and pivot then return pivot.Position.Y end
-    return nil
-end
-
-local function getTowerBottomY()
-    local tower = findTower() if not tower then return nil end
-    local minY = mhuge
-    for _, part in pairs(tower:GetDescendants()) do
-        if part:IsA("BasePart") then
-            local bottom = part.Position.Y - part.Size.Y / 2
-            if bottom < minY then minY = bottom end
-        end
-    end
-    return minY ~= mhuge and minY or nil
-end
-
--- GEDEDUPLICEERD: detectFloorY bevatte dezelfde raycast-logica als godDetectMapXRange
--- Beide functies behouden hun eigen gedrag, maar delen dezelfde map-zoeklogica via
--- de inline scan hieronder.
-local function detectFloorY()
-    local floors = {}
-
-    -- MzD-eigen vloer
-    for _, c in pairs(workspace:GetChildren()) do
-        if c:IsA("BasePart") and c.Name == "MzDGodFloor" then
-            tinsert(floors, {y = c.Position.Y + c.Size.Y/2, source = "GodFloor"})
-        end
-    end
-
-    -- Map-vloer
-    local map = nil
-    for _, c in pairs(workspace:GetChildren()) do
-        if c:IsA("Model") and sfind(c.Name,"Map") and not sfind(c.Name,"SharedInstances") then
-            if c:FindFirstChild("Spawners") or c:FindFirstChild("Gaps") or
-               c:FindFirstChild("FirstFloor") or c:FindFirstChild("Ground") then
-                map = c break
-            end
-            local cnt = 0
-            for _, d in pairs(c:GetDescendants()) do
-                if d:IsA("BasePart") then cnt += 1 end
-                if cnt > 10 then map = c break end
-            end
-            if map then break end
-        end
-    end
-
-    if map then
-        for _, name in pairs({"FirstFloor","Ground","Floor","BridgeFloor"}) do
-            local f = map:FindFirstChild(name)
-            if f and f:IsA("BasePart") then
-                tinsert(floors, {y = f.Position.Y + f.Size.Y/2, source = "Map:"..name})
-            end
-        end
-        local sp = map:FindFirstChild("Spawners")
-        if sp then
-            for _, s in pairs(sp:GetChildren()) do
-                if s:IsA("BasePart") and s.Size.X > 15 and s.Size.Z > 5 and s.Size.Y < 20
-                   and s.Position.Y > -15 and s.Position.Y < 30 then
-                    tinsert(floors, {y = s.Position.Y + s.Size.Y/2, source = "Spawner"})
-                end
-            end
-        end
-        for _, c2 in pairs(map:GetChildren()) do
-            if c2:IsA("BasePart") and not isMzDPart(c2)
-               and c2.Size.X > 30 and c2.Size.Z > 15 and c2.Size.Y < 15
-               and c2.Position.Y > -15 and c2.Position.Y < 30 then
-                tinsert(floors, {y = c2.Position.Y + c2.Size.Y/2, source = "MapPart"})
-            end
-        end
-    end
-
-    for _, c in pairs(workspace:GetChildren()) do
-        if sfind(c.Name,"SharedInstances") then
-            local fl = c:FindFirstChild("Floors")
-            if fl then
-                for _, f in pairs(fl:GetChildren()) do
-                    if f:IsA("BasePart") and f.Size.X > 15 and f.Size.Z > 5 then
-                        tinsert(floors, {y = f.Position.Y + f.Size.Y/2, source = "Shared"})
-                    end
-                end
-            end
-        end
-    end
-
-    local hrp = Player.Character and Player.Character:FindFirstChild("HumanoidRootPart")
-    if hrp then
-        local params = RaycastParams.new()
-        params.FilterType = Enum.RaycastFilterType.Exclude
-        local excl = {}
-        local tower = findTower()
-        if tower then tinsert(excl, tower) end
-        params.FilterDescendantsInstances = excl
-        local result = workspace:Raycast(hrp.Position, Vector3.new(0,-100,0), params)
-        if result then tinsert(floors, {y = result.Position.Y, source = "Raycast"}) end
-    end
-
-    if #floors == 0 then
-        if hrp then return hrp.Position.Y - 3, "PlayerFallback" end
-        return 0, "Default"
-    end
-    tsort(floors, function(a,b) return a.y > b.y end)
-    return floors[1].y, floors[1].source
-end
-
-local function moveTowerToFloor(floorTopY, offset)
-    local tower = findTower() if not tower then return false end
-    if not M._towerOriginalCF then
-        pcall(function() M._towerOriginalCF = tower:GetPivot() end)
-    end
-    local origPivot = M._towerOriginalCF if not origPivot then return false end
-    local currentPivot    = tower:GetPivot()
-    local currentPivotY   = currentPivot.Position.Y
-    local currentBottom   = getTowerBottomY() if not currentBottom then return false end
-    local alreadyMoved    = currentPivotY - origPivot.Position.Y
-    local originalBottomY = currentBottom - alreadyMoved
-    local targetBottom    = floorTopY + offset
-    local deltaY          = targetBottom - originalBottomY
-    if mabs(currentBottom - targetBottom) < 0.3 then return true end
-    pcall(function() tower:PivotTo(origPivot * CFrame.new(0, deltaY, 0)) end)
-    pcall(function()
-        for _, part in pairs(tower:GetDescendants()) do
-            if part:IsA("BasePart") then part.Anchored = true end
-        end
-    end)
-    M._towerMoved = true
-    M._towerLastTargetY    = targetBottom
-    M._towerDetectedFloorY = floorTopY
-    return true
-end
-
-local function restoreTower()
-    if not M._towerOriginalCF then return false end
-    local tower = findTower() if not tower then return false end
-    pcall(function() tower:PivotTo(M._towerOriginalCF) end)
-    M._towerMoved      = false
-    M._towerOriginalCF = nil
-    M._towerOriginalY  = nil
-    M._towerLastTargetY = nil
-    return true
-end
-
-local function startTowerWatcher()
-    if M._towerWatchThread then pcall(tcancel, M._towerWatchThread) end
-    M._towerWatchThread = tspawn(function()
-        while M.S.DoomTowerEnabled and M._towerMoved do
-            pcall(function()
-                local tower = findTower()
-                if tower and M._towerLastTargetY then
-                    local bottomY = getTowerBottomY()
-                    if bottomY and mabs(bottomY - M._towerLastTargetY) > 3 then
-                        local floorY = M._towerDetectedFloorY or detectFloorY()
-                        moveTowerToFloor(floorY, M.S.DoomTowerOffset)
-                    end
-                    for _, part in pairs(tower:GetDescendants()) do
-                        if part:IsA("BasePart") then part.Anchored = true end
-                    end
-                end
-            end)
-            twait(3)
-        end
-    end)
-end
-
-local function stopTowerWatcher()
-    if M._towerWatchThread then
-        pcall(tcancel, M._towerWatchThread)
-        M._towerWatchThread = nil
-    end
-end
-
-function M.enableTowerDrop()
-    M.S.DoomTowerEnabled = true
-    local floorY, source = detectFloorY()
-    M._towerDetectedFloorY = floorY
-    M._towerDetectedSource = source
-    local ok = moveTowerToFloor(floorY, M.S.DoomTowerOffset)
-    if ok then
-        startTowerWatcher()
-        M.Status.doomTower = "Aan (floor:" .. sformat("%.0f", floorY) .. " off:" .. M.S.DoomTowerOffset .. ")"
-    else
-        M.Status.doomTower = "Tower niet gevonden"
-    end
-    return ok
-end
-
-function M.disableTowerDrop()
-    M.S.DoomTowerEnabled = false
-    stopTowerWatcher()
-    restoreTower()
-    M._towerMoved  = false
-    M.Status.doomTower = "Uit"
-end
-
--- ============================================
--- [MODULE 10] DOOM EVENT COLLECTOR
--- ============================================
-
--- GEDEDUPLICEERD: fireAllDoomPrompts is de gedeelde prompt-fire helper
--- dezelfde logica wordt in valentine/candy hergebruikt via M.forceGrabPrompt
 local function fireAllDoomPrompts(parent)
     if not parent then return end
     for _, d in pairs(parent:GetDescendants()) do
@@ -568,26 +342,7 @@ local function scanDoomParts()
     local folder = workspace:FindFirstChild("DoomEventParts")
     if folder then
         for _, obj in pairs(folder:GetDescendants()) do
-            if obj:IsA("BasePart") then
-                tinsert(M._doomCachedParts, obj)
-            end
-            if obj:IsA("ProximityPrompt") then
-                pcall(function()
-                    obj.HoldDuration = 0
-                    obj.MaxActivationDistance = 99999
-                    obj.RequiresLineOfSight   = false
-                end)
-            end
-        end
-    end
-    local tower = findTower()
-    if tower then
-        for _, obj in pairs(tower:GetDescendants()) do
-            if obj:IsA("BasePart") and obj:FindFirstChild("TouchInterest") then
-                local found = false
-                for _, c in pairs(M._doomCachedParts) do if c == obj then found = true break end end
-                if not found then tinsert(M._doomCachedParts, obj) end
-            end
+            if obj:IsA("BasePart") then tinsert(M._doomCachedParts, obj) end
             if obj:IsA("ProximityPrompt") then
                 pcall(function()
                     obj.HoldDuration = 0
@@ -623,7 +378,7 @@ function M.startDoomCollector()
     M.S.DoomEnabled  = true
     M._doomCollected = 0
     M.Status.doomCount = 0
-    local partCount  = scanDoomParts()
+    local partCount = scanDoomParts()
 
     local folder = workspace:FindFirstChild("DoomEventParts")
     if not folder then
@@ -639,19 +394,13 @@ function M.startDoomCollector()
         M._doomDescConn = folder.DescendantAdded:Connect(handleDoomNewDesc)
     end
 
-    local tower = findTower()
-    if tower then
-        if M._doomTowerDescConn then pcall(function() M._doomTowerDescConn:Disconnect() end) end
-        M._doomTowerDescConn = tower.DescendantAdded:Connect(handleDoomNewDesc)
-    end
-
+    -- Eigen Heartbeat connectie — conflicteert nooit met andere collectors
     M._doomConn = RunService.Heartbeat:Connect(function()
         if not M.S.DoomEnabled then return end
         pcall(function()
             local hrp = Player.Character and Player.Character:FindFirstChild("HumanoidRootPart")
             if not hrp then return end
             if tick() - M._doomLastScan > 10 then
-                -- Opruimen van dode verwijzingen
                 local alive = {}
                 for _, p in pairs(M._doomCachedParts) do
                     if p and p.Parent then tinsert(alive, p) end
@@ -660,16 +409,6 @@ function M.startDoomCollector()
                 if folder2 then
                     for _, obj in pairs(folder2:GetDescendants()) do
                         if obj:IsA("BasePart") then
-                            local found = false
-                            for _, cached in pairs(alive) do if cached == obj then found = true break end end
-                            if not found then tinsert(alive, obj) end
-                        end
-                    end
-                end
-                local tw = findTower()
-                if tw then
-                    for _, obj in pairs(tw:GetDescendants()) do
-                        if obj:IsA("BasePart") and obj:FindFirstChild("TouchInterest") then
                             local found = false
                             for _, cached in pairs(alive) do if cached == obj then found = true break end end
                             if not found then tinsert(alive, obj) end
@@ -686,8 +425,6 @@ function M.startDoomCollector()
             end
             local folder3 = workspace:FindFirstChild("DoomEventParts")
             if folder3 then fireAllDoomPrompts(folder3) end
-            local tw2 = findTower()
-            if tw2 then fireAllDoomPrompts(tw2) end
             M._doomCollected = #M._doomCachedParts
         end)
     end)
@@ -696,16 +433,15 @@ end
 
 function M.stopDoomCollector()
     M.S.DoomEnabled = false
-    if M._doomConn      then pcall(function() M._doomConn:Disconnect()      end) M._doomConn = nil end
-    if M._doomDescConn  then pcall(function() M._doomDescConn:Disconnect()  end) M._doomDescConn = nil end
-    if M._doomTowerDescConn then pcall(function() M._doomTowerDescConn:Disconnect() end) M._doomTowerDescConn = nil end
+    if M._doomConn     then pcall(function() M._doomConn:Disconnect()     end) M._doomConn = nil end
+    if M._doomDescConn then pcall(function() M._doomDescConn:Disconnect() end) M._doomDescConn = nil end
     M._doomCachedParts = {}
     M._doomCollected   = 0
     M.Status.doom = "Uit"
 end
 
 -- ============================================
--- [MODULE 11] GOD MODE
+-- [MODULE 10] GOD MODE
 -- ============================================
 
 local function godFindFloorParts()
@@ -917,15 +653,14 @@ local function godStartKillWatcher()
     end)
 end
 
--- GEDEDUPLICEERD: addWallLogo was identiek in godBuildEgaleVloer en mapBuildWalls
--- Nu één gedeelde helper
-local function buildSurfaceGui(parent, face, theme, versionLabel)
+-- Gedeelde SurfaceGui bouwer (dedupliceert godBuildEgaleVloer + mapBuildWalls)
+local function buildSurfaceGui(parent, face, theme)
     pcall(function()
-        local sg    = Instance.new("SurfaceGui")
-        sg.Face     = face
-        sg.CanvasSize = Vector2.new(1600, 500)
+        local sg = Instance.new("SurfaceGui")
+        sg.Face        = face
+        sg.CanvasSize  = Vector2.new(1600, 500)
         sg.AlwaysOnTop = false
-        sg.Parent   = parent
+        sg.Parent      = parent
 
         local title = Instance.new("TextLabel")
         title.Size               = UDim2.new(1, 0, 0.6, 0)
@@ -941,21 +676,18 @@ local function buildSurfaceGui(parent, face, theme, versionLabel)
         sub.Size               = UDim2.new(0.5, 0, 0.2, 0)
         sub.Position           = UDim2.new(0.25, 0, 0.68, 0)
         sub.BackgroundTransparency = 1
-        sub.Text               = versionLabel or "v12.5"
+        sub.Text               = "v13.0"
         sub.TextColor3         = theme.stripe
         sub.TextScaled         = true
         sub.Font               = Enum.Font.Gotham
         sub.Parent             = sg
 
-        if not versionLabel then
-            -- Alleen de grotere canvas-versie (vloer) heeft de glow-kleur al; muren krijgen lijn
-            local line = Instance.new("Frame")
-            line.Size              = UDim2.new(0.7, 0, 0.025, 0)
-            line.Position          = UDim2.new(0.15, 0, 0.65, 0)
-            line.BackgroundColor3  = theme.stripe
-            line.BorderSizePixel   = 0
-            line.Parent            = sg
-        end
+        local line = Instance.new("Frame")
+        line.Size              = UDim2.new(0.7, 0, 0.025, 0)
+        line.Position          = UDim2.new(0.15, 0, 0.65, 0)
+        line.BackgroundColor3  = theme.stripe
+        line.BorderSizePixel   = 0
+        line.Parent            = sg
     end)
 end
 
@@ -965,13 +697,13 @@ local function godBuildEgaleVloer(map)
     end
     M._godCreatedParts = {}
     local startX, endX = godDetectMapXRange(map)
-    local floorY        = M.S.GodFloorY
-    local floorWidth    = 420
-    local floorThick    = 4
-    local theme         = getThemeColors()
-    local maxSeg        = 2000
-    local curX          = startX
-    local firstSeg      = true
+    local floorY     = M.S.GodFloorY
+    local floorWidth = 420
+    local floorThick = 4
+    local theme      = getThemeColors()
+    local maxSeg     = 2000
+    local curX       = startX
+    local firstSeg   = true
 
     while curX < endX do
         local segLen  = mmin(maxSeg, endX - curX)
@@ -989,7 +721,7 @@ local function godBuildEgaleVloer(map)
 
         if firstSeg then
             firstSeg = false
-            buildSurfaceGui(floor, Enum.NormalId.Top, theme, "v12.5")
+            buildSurfaceGui(floor, Enum.NormalId.Top, theme)
         end
 
         local topY = floorY + floorThick/2 + 0.1
@@ -1173,12 +905,7 @@ function M.enableGod()
     godTeleportUnder()
     twait(0.1)
     if Player.Character then godSetupHealth(Player.Character) end
-    local towerStatus = ""
-    if M.S.DoomTowerEnabled then
-        local tOk = M.enableTowerDrop()
-        towerStatus = tOk and " | Tower Y" or " | Tower X"
-    end
-    M.Status.god = "Aan (Y="..M.S.GodWalkY.." K:"..killCount.." V:"..#M._godCreatedParts..towerStatus..")"
+    M.Status.god = "Aan (Y="..M.S.GodWalkY.." K:"..killCount.." V:"..#M._godCreatedParts..")"
 end
 
 function M.disableGod()
@@ -1206,7 +933,7 @@ function M.disableGod()
 end
 
 -- ============================================
--- [MODULE 12] MOVEMENT & NAVIGATION
+-- [MODULE 11] MOVEMENT & NAVIGATION
 -- ============================================
 
 function M.safeEquip(tool)
@@ -1320,7 +1047,7 @@ function M.returnToBase()
 end
 
 -- ============================================
--- [MODULE 13] RARITY / FILTER HELPERS
+-- [MODULE 12] RARITY / FILTER HELPERS
 -- ============================================
 
 function M.isHighRarity(r)    return HIGH_RARITIES[r] == true end
@@ -1401,7 +1128,7 @@ end
 function M.matchesFilter(b, folderRarity)
     if not M.rarityMatches(folderRarity) then return false end
     if M.isHighRarity(folderRarity)      then return true end
-    local mut   = b:GetAttribute("Mutation") or "None"
+    local mut    = b:GetAttribute("Mutation") or "None"
     local isNone = (slower(mut) == "none" or mut == "")
     if M.S.TargetMutation == "None" then
         if not isNone then return false end
@@ -1434,7 +1161,7 @@ function M.toolMatchesRarity(tool, targetRarity, targetMutation)
     elseif targetMutation ~= "Any" then
         if tMut ~= targetMutation then return false end
     end
-    local tR = type(targetRarity) == "table" and targetRarity or {targetRarity}
+    local tR   = type(targetRarity) == "table" and targetRarity or {targetRarity}
     local isAny = false
     for _, r in pairs(tR) do if r == "Any" then isAny = true break end end
     if not isAny then
@@ -1486,7 +1213,7 @@ function M.getAvailableRarities()
 end
 
 -- ============================================
--- [MODULE 14] PLOT ACTION WRAPPERS
+-- [MODULE 13] PLOT ACTION WRAPPERS
 -- ============================================
 
 function M.placeBrainrot(s)
@@ -1500,14 +1227,14 @@ function M.clearSlot(s)         if not M.baseGUID then return end throttledPlotA
 function M.upgradeBrainrot(s)   if not M.baseGUID then return false end return throttledPlotAction("Upgrade Brainrot", M.baseGUID, tostring(s)) end
 
 -- ============================================
--- [MODULE 15] SLOT HELPERS
+-- [MODULE 14] SLOT HELPERS
 -- ============================================
 
 function M.isSlotEmpty(s)
     if not M.baseGUID then M.findBase() end if not M.baseGUID then return true end
-    local mb = workspace:FindFirstChild("Bases") and workspace.Bases:FindFirstChild(M.baseGUID) if not mb then return true end
+    local mb  = workspace:FindFirstChild("Bases") and workspace.Bases:FindFirstChild(M.baseGUID) if not mb then return true end
     local sm2 = mb:FindFirstChild("slot "..s.." brainrot") if not sm2 then return true end
-    local bn = sm2:GetAttribute("BrainrotName") return not bn or bn == ""
+    local bn  = sm2:GetAttribute("BrainrotName") return not bn or bn == ""
 end
 
 function M.findOccupiedSlots()
@@ -1527,7 +1254,7 @@ end
 
 function M.tweenToSlot(sn)
     if not M.baseGUID then M.findBase() end if not M.baseGUID then return false end
-    local mb = workspace:FindFirstChild("Bases") and workspace.Bases:FindFirstChild(M.baseGUID) if not mb then return false end
+    local mb  = workspace:FindFirstChild("Bases") and workspace.Bases:FindFirstChild(M.baseGUID) if not mb then return false end
     local sm2 = mb:FindFirstChild("slot "..sn.." brainrot") if not sm2 then return false end
     local root = sm2:FindFirstChild("Root")
     if root and root:IsA("BasePart") then return M.tweenTo(root.CFrame * CFrame.new(0,3,0)) end
@@ -1551,6 +1278,7 @@ function M.upgradeSlotToMax(slot)
 end
 
 function M.findBrainrotRoot(b)
+    if not b then return nil end
     local root = b:FindFirstChild("Root") if root and root:IsA("BasePart") then return root end
     local rendered = b:FindFirstChild("RenderedBrainrot")
     if rendered then local rr = rendered:FindFirstChild("Root") if rr and rr:IsA("BasePart") then return rr end end
@@ -1575,14 +1303,21 @@ function M.findTargetToolInBackpack()
 end
 
 -- ============================================
--- [MODULE 16] FACTORY LOOP
+-- [MODULE 15] FACTORY LOOP — VOLLEDIG HERSCHREVEN
+-- FIXED: Pakt alle brainrots uit backpack van de
+--        geselecteerde rarity. Per brainrot:
+--        1. Equip → Place op werkslot
+--        2. Max upgraden zo snel mogelijk
+--        3. PickUp → Unequip
+--        Herhaal voor elke brainrot. Werkt voor
+--        ALLE rarities inclusief high rarities.
 -- ============================================
 
 local function factoryToolMatchesRarity(tool)
-    local tMut   = tool:GetAttribute("Mutation") or "None"
-    local lvl    = tonumber(tool:GetAttribute("Level")) or 0
-    local bName  = tool:GetAttribute("BrainrotName")
-    local tRar   = tool:GetAttribute("Rarity")
+    local tMut  = tool:GetAttribute("Mutation") or "None"
+    local lvl   = tonumber(tool:GetAttribute("Level")) or 0
+    local bName = tool:GetAttribute("BrainrotName")
+    local tRar  = tool:GetAttribute("Rarity")
     if not bName or bName == "" then return false end
     if tRar and M.isHighRarity(tRar) then
         return M.S.FactoryRarity == "Any" or M.S.FactoryRarity == tRar
@@ -1605,6 +1340,22 @@ local function factoryToolMatchesRarity(tool)
     return true
 end
 
+-- Verzamel ALLE matching tools uit backpack + equipped
+local function getAllFactoryTools()
+    local tools = {}
+    local bp = Player:FindFirstChild("Backpack")
+    if bp then
+        for _, t in pairs(bp:GetChildren()) do
+            if t:IsA("Tool") and factoryToolMatchesRarity(t) then tinsert(tools, t) end
+        end
+    end
+    if Player.Character then
+        local eq = Player.Character:FindFirstChildWhichIsA("Tool")
+        if eq and factoryToolMatchesRarity(eq) then tinsert(tools, eq) end
+    end
+    return tools
+end
+
 function M.startFactoryLoop()
     if M.factoryThread then return end
     M.S.FactoryEnabled  = true
@@ -1616,64 +1367,122 @@ function M.startFactoryLoop()
             local ok, err = pcall(function()
                 if not M.baseGUID then M.findBase() end
                 if not M.baseGUID then twait(2) return end
-                local ws            = tonumber(M.S.FactorySlot) or 5
-                local isHighRarMode = M.isHighRarity(M.S.FactoryRarity)
-                M.tweenToSlot(ws) twait(0.2)
+
+                local ws = tonumber(M.S.FactorySlot) or 5
+
+                -- Leeg de werkslot eerst als die bezet is
                 if not M.isSlotEmpty(ws) then
-                    M.pickUpBrainrot(ws) twait(1)
-                    pcall(function() Player.Character.Humanoid:UnequipTools() end)
-                    twait(0.5)
+                    M.pickUpBrainrot(ws) twait(1.0)
+                    M.safeUnequip() twait(0.4)
                 end
-                local tool, sa = nil, 0
-                while not tool and sa < 5 do
-                    sa += 1
-                    local bp = Player:FindFirstChild("Backpack")
-                    if bp then
-                        for _, t in pairs(bp:GetChildren()) do
-                            if t:IsA("Tool") and factoryToolMatchesRarity(t) then tool = t break end
-                        end
-                    end
-                    if not tool and Player.Character then
-                        local eq = Player.Character:FindFirstChildWhichIsA("Tool")
-                        if eq and factoryToolMatchesRarity(eq) then tool = eq end
-                    end
-                    if not tool and sa < 5 then twait(0.6) end
-                end
-                if not tool then
+
+                -- Haal alle matching tools op uit backpack
+                local tools = getAllFactoryTools()
+
+                if #tools == 0 then
                     stopReason = "Klaar! (geen tools meer)"
-                    M.S.FactoryEnabled = false return
+                    M.S.FactoryEnabled = false
+                    return
                 end
-                local bName   = tool:GetAttribute("BrainrotName") or "Item"
-                local tRar    = tool:GetAttribute("Rarity") or ""
-                local isHighT = M.isHighRarity(tRar)
-                local hum     = Player.Character and Player.Character:FindFirstChild("Humanoid")
-                if hum then hum:EquipTool(tool) twait(0.5) end
-                M.placeBrainrot(ws) twait(0.8)
-                if M.isSlotEmpty(ws) then
-                    pcall(function() if hum then hum:UnequipTools() end end) twait(1) return
-                end
-                if not isHighT then
-                    local myBase = workspace:FindFirstChild("Bases") and workspace.Bases:FindFirstChild(M.baseGUID)
-                    local sm2    = myBase and myBase:FindFirstChild("slot "..ws.." brainrot")
-                    if sm2 then
-                        local cur, fails = tonumber(sm2:GetAttribute("Level")) or 0, 0
-                        while cur < M.S.FactoryMaxLevel and M.S.FactoryEnabled do
-                            M.upgradeBrainrot(ws) twait(0.1)
-                            local nw = tonumber(sm2:GetAttribute("Level")) or cur
-                            if nw > cur then fails = 0 cur = nw M.Status.factory = bName.." Lv."..cur.."/"..M.S.FactoryMaxLevel
-                            else fails += 1 if fails > 60 then stopReason = "Geld op!" M.S.FactoryEnabled = false break end end
+
+                -- Verwerk elke tool één voor één
+                for i = 1, #tools do
+                    if not M.S.FactoryEnabled then break end
+
+                    local tool = tools[i]
+                    -- Verifieer dat de tool nog bestaat en in backpack/char zit
+                    if not tool or not tool.Parent then
+                        -- Tool verdwenen, skip
+                    else
+                        local bName   = tool:GetAttribute("BrainrotName") or "Item"
+                        local tRar    = tool:GetAttribute("Rarity") or ""
+                        local isHighT = M.isHighRarity(tRar)
+
+                        M.Status.factory = "🔧 " .. bName .. (isHighT and " ★" or "")
+
+                        -- Zorg dat slot leeg is voor we plaatsen
+                        if not M.isSlotEmpty(ws) then
+                            M.pickUpBrainrot(ws) twait(1.0) M.safeUnequip() twait(0.4)
                         end
-                    end
-                else
-                    M.Status.factory = "★ "..tRar..": "..bName.." (gezet)" twait(1)
-                end
-                twait(0.5)
-                M.pickUpBrainrot(ws) twait(1.2)
-                M.Status.factoryCount += 1
-                pcall(function() if hum then hum:UnequipTools() end end) twait(0.5)
-                M.Status.factory = (isHighT and "★ Done " or "Done ")..bName.." (#"..M.Status.factoryCount..")"
+
+                        -- Equip de tool
+                        local hum = Player.Character and Player.Character:FindFirstChild("Humanoid")
+                        if hum then
+                            pcall(function() hum:EquipTool(tool) end)
+                            twait(0.5)
+                        end
+
+                        -- Controleer of tool nu equipped is
+                        local equippedOk = false
+                        if Player.Character then
+                            local eq = Player.Character:FindFirstChildWhichIsA("Tool")
+                            equippedOk = eq ~= nil
+                        end
+
+                        if not equippedOk then
+                            -- Equip mislukt, probeer via backpack lookup
+                            local bp = Player:FindFirstChild("Backpack")
+                            if bp then
+                                for _, t in pairs(bp:GetChildren()) do
+                                    if t == tool and hum then
+                                        pcall(function() hum:EquipTool(t) end)
+                                        twait(0.5) break
+                                    end
+                                end
+                            end
+                        end
+
+                        -- Plaats op werkslot
+                        M.placeBrainrot(ws) twait(0.8)
+
+                        if M.isSlotEmpty(ws) then
+                            -- Plaatsen mislukt, unequip en naar volgende
+                            pcall(function() if hum then hum:UnequipTools() end end)
+                            twait(0.3)
+                        else
+                            -- Max upgraden (skip voor high rarities)
+                            if not isHighT then
+                                local mb  = workspace:FindFirstChild("Bases") and workspace.Bases:FindFirstChild(M.baseGUID)
+                                local sm2 = mb and mb:FindFirstChild("slot "..ws.." brainrot")
+                                if sm2 then
+                                    local cur, fails = tonumber(sm2:GetAttribute("Level")) or 0, 0
+                                    while cur < M.S.FactoryMaxLevel and M.S.FactoryEnabled do
+                                        M.upgradeBrainrot(ws)
+                                        twait(0.05) -- zo snel mogelijk
+                                        local nw = tonumber(sm2:GetAttribute("Level")) or cur
+                                        if nw > cur then
+                                            fails = 0
+                                            cur   = nw
+                                            M.Status.factory = bName .. " Lv." .. cur .. "/" .. M.S.FactoryMaxLevel
+                                        else
+                                            fails += 1
+                                            if fails > 80 then
+                                                stopReason = "Geld op!"
+                                                M.S.FactoryEnabled = false
+                                                break
+                                            end
+                                        end
+                                    end
+                                end
+                            else
+                                M.Status.factory = "★ " .. tRar .. ": " .. bName .. " (gezet)"
+                                twait(0.5)
+                            end
+
+                            if M.S.FactoryEnabled then
+                                -- Oppakken van slot
+                                M.pickUpBrainrot(ws) twait(1.0)
+                                M.Status.factoryCount += 1
+                                pcall(function() if hum then hum:UnequipTools() end end)
+                                twait(0.3)
+                                M.Status.factory = (isHighT and "★ Done " or "Done ") .. bName .. " (#" .. M.Status.factoryCount .. ")"
+                            end
+                        end
+                    end -- tool.Parent check
+                end -- for tools
             end)
             if not ok then twait(1) end
+            if M.S.FactoryEnabled then twait(0.1) end
         end
         M.Status.factory = stopReason
         M.factoryThread  = nil
@@ -1690,7 +1499,7 @@ function M.stopFactoryLoop()
 end
 
 -- ============================================
--- [MODULE 17] FARMING LOOP
+-- [MODULE 16] FARMING LOOP
 -- ============================================
 
 function M.startFarming()
@@ -1828,6 +1637,359 @@ function M.stopFarming()
     M.S.Farming = false
     if M.farmThread then pcall(tcancel, M.farmThread) M.farmThread = nil end
     M.Status.farm = "Idle"
+end
+
+-- ============================================
+-- [MODULE 17] TOWER TRIAL FARM — v18 logica
+-- Geïntegreerd: haltMovement, nil-checks op
+-- fireproximityprompt, findRoot fallback,
+-- Walk Y fine-tune via GUI knoppen.
+-- ============================================
+
+-- Bewegingsstop helper (uit v18)
+local function haltMovement()
+    local char = Player.Character if not char then return end
+    local hrp  = char:FindFirstChild("HumanoidRootPart")
+    local hum  = char:FindFirstChildOfClass("Humanoid")
+    if hum and hrp then hum:MoveTo(hrp.Position) end
+    if hrp then
+        local cf = hrp.CFrame
+        hrp.Anchored    = true
+        hrp.Velocity    = Vector3.zero
+        hrp.RotVelocity = Vector3.zero
+        twait(0.05)
+        hrp.Anchored = false
+        hrp.CFrame   = cf
+    end
+end
+
+local function getTowerForTrial()
+    local ok, t = pcall(function() return workspace.GameObjects.PlaceSpecific.root.Tower end)
+    if ok and t then return t end
+    for _, c in pairs(workspace:GetDescendants()) do
+        if c.Name == "Tower" and c:IsA("Model") then
+            local cnt = 0
+            for _, d in pairs(c:GetDescendants()) do
+                if d:IsA("BasePart") then cnt += 1 end
+                if cnt > 5 then return c end
+            end
+        end
+    end
+    return nil
+end
+
+-- nil-check op fireproximityprompt (niet alle executors hebben dit)
+local function trialFirePrompts(targetModel)
+    if not targetModel then return end
+    for _, d in pairs(targetModel:GetDescendants()) do
+        if d:IsA("ProximityPrompt") then
+            pcall(function()
+                d.RequiresLineOfSight    = false
+                d.HoldDuration          = 0
+                d.MaxActivationDistance = 99999
+                d.Enabled               = true
+            end)
+            if fireproximityprompt then
+                pcall(function() fireproximityprompt(d) end)
+            end
+        end
+    end
+end
+
+local function trialGetBar()
+    local hud = Player.PlayerGui:FindFirstChild("TowerTrialHUD")
+    return hud and hud:FindFirstChild("TrialBar")
+end
+
+local function trialGetTimer()
+    local bar = trialGetBar() if not bar then return "" end
+    local lbl = bar:FindFirstChild("Timer")
+    return lbl and lbl.Text or ""
+end
+
+local function trialGetDeposits()
+    local bar = trialGetBar() if not bar then return 0, 10 end
+    local lbl = bar:FindFirstChild("Deposits") if not lbl then return 0, 10 end
+    local cur, goal = lbl.Text:match("(%d+)%s*/%s*(%d+)")
+    return tonumber(cur) or 0, tonumber(goal) or 10
+end
+
+local function trialGetRarity()
+    local bar = trialGetBar() if not bar then return "?" end
+    local lbl = bar:FindFirstChild("Requirement")
+    if lbl and lbl.Text ~= "" then
+        local txt = lbl.Text:gsub("<[^>]+>",""):match("^%s*(.-)%s*$")
+        if txt ~= "" then return txt:match("Tower Trial:%s*(.+)") or txt end
+    end
+    for _, child in pairs(bar:GetDescendants()) do
+        if child:IsA("TextLabel") and child.Text ~= "" then
+            local txt    = child.Text:gsub("<[^>]+>","")
+            local rarity = txt:match("Tower Trial:%s*(.+)")
+            if rarity then return rarity:match("^%s*(.-)%s*$") end
+        end
+    end
+    return "?"
+end
+
+local function trialIsActive()
+    local bar = trialGetBar()
+    if not bar or not bar.Visible then return false end
+    local t = trialGetTimer()
+    return t ~= "" and t ~= "00:00" and t ~= "0:00"
+end
+
+local function trialGetLiveCooldown()
+    local tower = getTowerForTrial() if not tower then return nil end
+    for _, d in pairs(tower:GetDescendants()) do
+        if d:IsA("TextLabel") and d.Text ~= "" then
+            local m, s = d.Text:match("(%d%d?):(%d%d)")
+            if m and s then return (tonumber(m)*60) + tonumber(s) end
+        end
+    end
+    return nil
+end
+
+local function trialKillPopups()
+    pcall(function()
+        for _, gui in pairs(Player.PlayerGui:GetDescendants()) do
+            if gui:IsA("TextLabel") or gui:IsA("TextButton") then
+                local txt = slower(gui.Text)
+                if sfind(txt,"claim") or sfind(txt,"reward") or sfind(txt,"worthy") then
+                    local f = gui:FindFirstAncestorWhichIsA("Frame")
+                    if f and f.Visible and f.Name ~= "TrialBar" and f.Name ~= "TowerTrialHUD" then
+                        f.Visible = false
+                    end
+                end
+            end
+        end
+    end)
+end
+
+local function trialGetToolCount()
+    local count = 0
+    local bp = Player:FindFirstChild("Backpack")
+    if bp then for _, t in pairs(bp:GetChildren()) do if t:IsA("Tool") then count += 1 end end end
+    if Player.Character then
+        for _, t in pairs(Player.Character:GetChildren()) do if t:IsA("Tool") then count += 1 end end
+    end
+    return count
+end
+
+-- findRoot met fallback (v18 patroon)
+local function trialFindRoot(b)
+    if not b then return nil end
+    if M.findBrainrotRoot then
+        local root = M.findBrainrotRoot(b)
+        if root then return root end
+    end
+    local r = b:FindFirstChild("Root")
+    if r and r:IsA("BasePart") then return r end
+    local rendered = b:FindFirstChild("RenderedBrainrot")
+    if rendered then local rr = rendered:FindFirstChild("Root") if rr and rr:IsA("BasePart") then return rr end end
+    if b:IsA("Model") and b.PrimaryPart then return b.PrimaryPart end
+    for _, d in pairs(b:GetDescendants()) do if d:IsA("BasePart") then return d end end
+    return nil
+end
+
+function M.startTowerTrial()
+    if M._towerTrialThread then return end
+    M._towerTrialEnabled  = true
+    M.S.TowerTrialEnabled = true
+    M.Status.towerTrialCount = 0
+    M.Status.towerTrial   = "Opstarten..."
+
+    M._towerTrialThread = tspawn(function()
+        local state         = "ACTIVATE"
+        local depBeforeTrip = 0
+        local trialsDone    = 0
+        local trips         = 0
+
+        M.safeUnequip() twait(0.3)
+
+        while M._towerTrialEnabled do
+            local ok, err = pcall(function()
+                trialKillPopups()
+
+                -- ── STATE: ACTIVATE ──────────────────────────────
+                if state == "ACTIVATE" then
+                    if trialIsActive() then state = "COLLECT" return end
+                    local liveCd = trialGetLiveCooldown()
+                    if liveCd and liveCd > 0 then
+                        M.Status.towerTrial = "⚠️ Tower op cooldown..."
+                        state = "COOLDOWN" return
+                    end
+
+                    local tower = getTowerForTrial()
+                    if not tower then
+                        M.Status.towerTrial = "⚠️ Tower niet gevonden"
+                        twait(3) return
+                    end
+                    M.Status.towerTrial = "🏃 Naar tower..."
+                    if M._isGod then M.safePathTo(tower:GetPivot() * CFrame.new(0,3,0))
+                    else M.tweenTo(tower:GetPivot() * CFrame.new(0,3,0)) end
+
+                    for i = 1, 15 do
+                        if not M._towerTrialEnabled then break end
+                        M.Status.towerTrial = "🏁 Activeer trial... " .. i
+                        trialFirePrompts(tower)
+                        twait(0.6)
+                        if trialIsActive() then
+                            M.Status.towerTrial = "✅ Trial actief! " .. trialGetRarity()
+                            state = "COLLECT" return
+                        end
+                    end
+
+                    local cd = trialGetLiveCooldown()
+                    if cd and cd > 0 then state = "COOLDOWN"
+                    else M.Status.towerTrial = "⚠️ Activeren mislukt" twait(5) end
+                    return
+                end
+
+                -- ── STATE: COLLECT ───────────────────────────────
+                if state == "COLLECT" then
+                    if M.isDead() then M.waitForRespawn() twait(2) return end
+                    local cur, goal = trialGetDeposits()
+                    M.Status.towerTrial = "💝 " .. cur .. "/" .. goal .. " | Trips: " .. trips .. " | #" .. trialsDone
+
+                    if cur >= goal then
+                        -- Claim
+                        pcall(function()
+                            local rs     = game:GetService("ReplicatedStorage")
+                            local shared = rs:FindFirstChild("Shared")
+                            local remote = shared
+                                and shared:FindFirstChild("Remotes")
+                                and shared.Remotes:FindFirstChild("Networking")
+                                and shared.Remotes.Networking:FindFirstChild("RE/Tower/TowerClaimConfirmed")
+                            if remote then remote:FireServer() end
+                        end)
+                        twait(1.5)
+                        trialsDone += 1
+                        M.Status.towerTrialCount = trialsDone
+                        M.Status.towerTrial = "🎉 Trial #" .. trialsDone .. " KLAAR!"
+                        M.safeUnequip()
+                        state = "COOLDOWN" return
+                    end
+
+                    -- Pak brainrot op
+                    local activeBrainrots = workspace:FindFirstChild("ActiveBrainrots")
+                    if not activeBrainrots then twait(2) return end
+                    local required = trialGetRarity()
+                    if required == "?" then twait(1) return end
+
+                    local list = {}
+                    local hrp  = Player.Character and Player.Character:FindFirstChild("HumanoidRootPart")
+                    for _, folder in pairs(activeBrainrots:GetChildren()) do
+                        if folder.Name == required then
+                            for _, b in pairs(folder:GetChildren()) do
+                                local root = trialFindRoot(b)
+                                if root then
+                                    local dist = hrp and (hrp.Position - root.Position).Magnitude or 0
+                                    tinsert(list, {b=b, root=root, dist=dist})
+                                end
+                            end
+                        end
+                    end
+                    tsort(list, function(a, bx) return a.dist < bx.dist end)
+
+                    if #list == 0 then
+                        M.Status.towerTrial = "⏳ Geen " .. required .. " op de map..."
+                        twait(1.5) return
+                    end
+
+                    local entry      = list[1]
+                    local startTools = trialGetToolCount()
+                    M.Status.towerTrial = "🧠 Ophalen " .. required .. " (" .. mfloor(entry.dist) .. "m)"
+                    if M._isGod then M.safePathTo(entry.root.CFrame * CFrame.new(0,3,0))
+                    else M.tweenTo(entry.root.CFrame * CFrame.new(0,3,0)) end
+
+                    for attempt = 1, 6 do
+                        if not M._towerTrialEnabled then break end
+                        if not entry.b or not entry.b.Parent then break end
+                        if trialGetToolCount() > startTools then break end
+                        M.forceGrabPrompt(entry.root)
+                        M.forceGrabPrompt(entry.b)
+                        twait(0.3)
+                    end
+
+                    if trialGetToolCount() > startTools then
+                        depBeforeTrip = cur
+                        state = "SUBMIT"
+                    else
+                        M.Status.towerTrial = "⏳ Ophalen mislukt" twait(1)
+                    end
+                    return
+                end
+
+                -- ── STATE: SUBMIT ────────────────────────────────
+                if state == "SUBMIT" then
+                    trips += 1
+                    local tower = getTowerForTrial()
+                    if not tower then state = "COLLECT" return end
+                    M.Status.towerTrial = "📦 Submit #" .. trips
+                    if M._isGod then M.safePathTo(tower:GetPivot() * CFrame.new(0,3,0))
+                    else M.tweenTo(tower:GetPivot() * CFrame.new(0,3,0)) end
+
+                    local t0        = tick()
+                    local deposited = false
+                    while tick() - t0 < 8 do
+                        if not M._towerTrialEnabled then break end
+                        trialFirePrompts(tower)
+                        twait(0.4)
+                        local cur2, _ = trialGetDeposits()
+                        if cur2 > depBeforeTrip then deposited = true break end
+                    end
+
+                    if deposited then
+                        twait(3)
+                        M.safeUnequip()
+                    else
+                        M.Status.towerTrial = "⚠️ Submit mislukt"
+                        M.safeUnequip()
+                    end
+                    state = "COLLECT"
+                    return
+                end
+
+                -- ── STATE: COOLDOWN ──────────────────────────────
+                if state == "COOLDOWN" then
+                    local remaining = M.S.TowerTrialFallbackCd
+                    while M._towerTrialEnabled do
+                        trialKillPopups()
+                        local live = trialGetLiveCooldown()
+                        if live ~= nil then remaining = live end
+                        if remaining <= 0 then
+                            M.Status.towerTrial = "✅ Cooldown klaar!"
+                            twait(2) state = "ACTIVATE" return
+                        end
+                        local mm = mfloor(remaining/60)
+                        local ss = mfloor(remaining%60)
+                        M.Status.towerTrial = sformat("⏳ Cooldown: %d:%02d", mm, ss)
+                        if live == nil then remaining -= 1 end
+                        twait(1)
+                    end
+                    return
+                end
+            end)
+
+            if not ok then
+                M.Status.towerTrial = "❌ " .. tostring(err):sub(1,50)
+                twait(3)
+            end
+            twait(0.05)
+        end
+
+        haltMovement()
+        M.Status.towerTrial = "Gestopt"
+        M._towerTrialThread = nil
+    end)
+end
+
+function M.stopTowerTrial()
+    M._towerTrialEnabled  = false
+    M.S.TowerTrialEnabled = false
+    if M._towerTrialThread then pcall(tcancel, M._towerTrialThread) M._towerTrialThread = nil end
+    haltMovement()
+    M.Status.towerTrial = "Idle"
 end
 
 -- ============================================
@@ -2056,17 +2218,13 @@ end
 M.setupInstant()
 
 -- ============================================
--- [MODULE 23] CANDY EVENT COLLECTOR
--- GEDEDUPLICEERD: zelfde structuur als ValentinesCoinParts collector
--- Beide gebruiken nu dezelfde interne helper-patroon
+-- [MODULE 23] CANDY / VALENTINE COLLECTORS
 -- ============================================
 
--- Gedeelde cache-builder: voorkomt copy-paste tussen Candy en Valentine collector
-local function buildPartCache(folderName, cacheTable, lastScanRef)
+local function buildPartCache(folderName, cacheTable)
     local folder = workspace:FindFirstChild(folderName)
     if not folder then return end
-    local fresh = {}
-    local seen  = {}
+    local fresh, seen = {}, {}
     for _, p in pairs(folder:GetDescendants()) do
         if p:IsA("BasePart") and not seen[p] then seen[p] = true tinsert(fresh, p) end
     end
@@ -2079,16 +2237,15 @@ local function buildPartCache(folderName, cacheTable, lastScanRef)
         end
     end
     for i = 1, #fresh do cacheTable[i] = fresh[i] end
-    -- trim eventuele oude entries
     for i = #fresh + 1, #cacheTable do cacheTable[i] = nil end
 end
 
 function M._candyStartCollector()
     if M._candyCollectorConn  then pcall(function() M._candyCollectorConn:Disconnect()  end) M._candyCollectorConn = nil end
     if M._candyDescAddedConn  then pcall(function() M._candyDescAddedConn:Disconnect()  end) M._candyDescAddedConn = nil end
-    M._candyCachedParts       = {}
-    M._candyLastCacheScan     = tick()
-    buildPartCache("CandyEventParts", M._candyCachedParts, M._candyLastCacheScan)
+    M._candyCachedParts   = {}
+    M._candyLastCacheScan = tick()
+    buildPartCache("CandyEventParts", M._candyCachedParts)
 
     local function onNewDesc(d)
         if not M.S.ValentineEnabled then return end
@@ -2108,7 +2265,7 @@ function M._candyStartCollector()
         tspawn(function()
             local f2 = workspace:WaitForChild("CandyEventParts", 60)
             if f2 and M.S.ValentineEnabled then
-                buildPartCache("CandyEventParts", M._candyCachedParts, M._candyLastCacheScan)
+                buildPartCache("CandyEventParts", M._candyCachedParts)
                 M._candyDescAddedConn = f2.DescendantAdded:Connect(onNewDesc)
             end
         end)
@@ -2120,7 +2277,7 @@ function M._candyStartCollector()
             local hrp = Player.Character and Player.Character:FindFirstChild("HumanoidRootPart")
             if not hrp then return end
             if tick() - M._candyLastCacheScan > 5 then
-                buildPartCache("CandyEventParts", M._candyCachedParts, M._candyLastCacheScan)
+                buildPartCache("CandyEventParts", M._candyCachedParts)
                 M._candyLastCacheScan = tick()
             end
             for _, p in pairs(M._candyCachedParts) do
@@ -2135,10 +2292,6 @@ function M._candyStopCollector()
     if M._candyDescAddedConn then pcall(function() M._candyDescAddedConn:Disconnect() end) M._candyDescAddedConn = nil end
     M._candyCachedParts = {}
 end
-
--- ============================================
--- [MODULE 24] VALENTINE EVENT
--- ============================================
 
 function M.getHeartCount()
     local count = 0
@@ -2196,9 +2349,9 @@ end
 function M._valentineStartCoinCollector()
     if M.valentineCollectorConn   then pcall(function() M.valentineCollectorConn:Disconnect()  end) M.valentineCollectorConn = nil end
     if M._valentineDescAddedConn  then pcall(function() M._valentineDescAddedConn:Disconnect() end) M._valentineDescAddedConn = nil end
-    M._valentineCachedParts    = {}
-    M._valentineLastCacheScan  = tick()
-    buildPartCache("ValentinesCoinParts", M._valentineCachedParts, M._valentineLastCacheScan)
+    M._valentineCachedParts   = {}
+    M._valentineLastCacheScan = tick()
+    buildPartCache("ValentinesCoinParts", M._valentineCachedParts)
 
     local function onNewDesc(d)
         if not M.S.ValentineEnabled then return end
@@ -2218,7 +2371,7 @@ function M._valentineStartCoinCollector()
         tspawn(function()
             local f2 = workspace:WaitForChild("ValentinesCoinParts", 60)
             if f2 and M.S.ValentineEnabled then
-                buildPartCache("ValentinesCoinParts", M._valentineCachedParts, M._valentineLastCacheScan)
+                buildPartCache("ValentinesCoinParts", M._valentineCachedParts)
                 M._valentineDescAddedConn = f2.DescendantAdded:Connect(onNewDesc)
             end
         end)
@@ -2230,7 +2383,7 @@ function M._valentineStartCoinCollector()
             local hrp = Player.Character and Player.Character:FindFirstChild("HumanoidRootPart")
             if not hrp then return end
             if tick() - M._valentineLastCacheScan > 5 then
-                buildPartCache("ValentinesCoinParts", M._valentineCachedParts, M._valentineLastCacheScan)
+                buildPartCache("ValentinesCoinParts", M._valentineCachedParts)
                 M._valentineLastCacheScan = tick()
             end
             for _, p in pairs(M._valentineCachedParts) do
@@ -2310,8 +2463,8 @@ function M.startValentine()
                     M.waitForRespawn() twait(1)
                     if not M._isGod then M.enableGod() end return
                 end
-                local h         = M.getHeartCount()
-                local coinCount = #M._valentineCachedParts
+                local h          = M.getHeartCount()
+                local coinCount  = #M._valentineCachedParts
                 local candyCount = #M._candyCachedParts
                 M.Status.valentine = "💝 "..h.."/100 | 🪙 "..coinCount.." | 🍬 "..candyCount.." | #"..submitCount
                 if h >= 100 then
@@ -2327,7 +2480,7 @@ function M.startValentine()
                             M.Status.valentine = "⚠️ Submit mislukt? H:"..h
                         end
                     else
-                        M.Status.valentine = "⚠️ Kon niet submiten, retry..." twait(2)
+                        M.Status.valentine = "⚠️ Retry..." twait(2)
                     end
                     twait(0.5)
                 else
@@ -2336,7 +2489,6 @@ function M.startValentine()
             end)
             if not ok then twait(1) end
         end
-        -- Cleanup
         if M.valentineCollectorConn  then pcall(function() M.valentineCollectorConn:Disconnect()  end) M.valentineCollectorConn = nil end
         if M._valentineDescAddedConn then pcall(function() M._valentineDescAddedConn:Disconnect() end) M._valentineDescAddedConn = nil end
         M._valentineCachedParts = {}
@@ -2356,7 +2508,7 @@ function M.stopValentine()
 end
 
 -- ============================================
--- [MODULE 25] ARCADE EVENT
+-- [MODULE 24] ARCADE EVENT
 -- ============================================
 
 function M.startArcade()
@@ -2396,7 +2548,7 @@ function M.stopArcade()
 end
 
 -- ============================================
--- [MODULE 26] MAP FIXER
+-- [MODULE 25] MAP FIXER
 -- ============================================
 
 local MF = {W=420, WH=220, WT=6, INT=8}
@@ -2640,15 +2792,15 @@ function M.mapBuildWalls(map, sx, ex)
     for i, s in pairs(segs) do
         local cx = s.s + s.l/2
         local fw = mw("FrontWall_"..i, Vector3.new(s.l, WALL_H, MF.WT), Vector3.new(cx, WALL_MID_Y, MF.SZ + MF.WT/2))
-        buildSurfaceGui(fw, Enum.NormalId.Front, theme, nil)
-        buildSurfaceGui(fw, Enum.NormalId.Back,  theme, nil)
+        buildSurfaceGui(fw, Enum.NormalId.Front, theme)
+        buildSurfaceGui(fw, Enum.NormalId.Back,  theme)
         ms("FS_bot"..i, Vector3.new(s.l,2,0.4), Vector3.new(cx, sBot, MF.SZ+MF.WT+0.3))
         ms("FS_mid"..i, Vector3.new(s.l,1,0.4), Vector3.new(cx, sMid, MF.SZ+MF.WT+0.3))
         ms("FS_top"..i, Vector3.new(s.l,2,0.4), Vector3.new(cx, sTop, MF.SZ+MF.WT+0.3))
 
         local bw = mw("BackWall_"..i, Vector3.new(s.l, WALL_H, MF.WT), Vector3.new(cx, WALL_MID_Y, -MF.SZ - MF.WT/2))
-        buildSurfaceGui(bw, Enum.NormalId.Front, theme, nil)
-        buildSurfaceGui(bw, Enum.NormalId.Back,  theme, nil)
+        buildSurfaceGui(bw, Enum.NormalId.Front, theme)
+        buildSurfaceGui(bw, Enum.NormalId.Back,  theme)
         ms("BS_bot"..i, Vector3.new(s.l,2,0.4), Vector3.new(cx, sBot, -MF.SZ-MF.WT-0.3))
         ms("BS_mid"..i, Vector3.new(s.l,1,0.4), Vector3.new(cx, sMid, -MF.SZ-MF.WT-0.3))
         ms("BS_top"..i, Vector3.new(s.l,2,0.4), Vector3.new(cx, sTop, -MF.SZ-MF.WT-0.3))
@@ -2704,7 +2856,6 @@ function M.mapRunFix()
         pcall(function() M.mapFillGaps(map, sx, ex) end)
         pcall(function() M.mapBuildWalls(map, sx, ex) end)
         M.Status.mapFixer = "Gefixed: "..map.Name
-        if M.S.DoomTowerEnabled then twait(0.5) M.enableTowerDrop() end
     end
     pcall(function() M.mapFixCollision(map, si) end)
 end
@@ -2730,7 +2881,7 @@ function M.stopMapFixer()
 end
 
 -- ============================================
--- [MODULE 27] RESPAWN HANDLER
+-- [MODULE 26] RESPAWN HANDLER
 -- ============================================
 
 Player.CharacterAdded:Connect(function(character)
@@ -2750,17 +2901,13 @@ Player.CharacterAdded:Connect(function(character)
             end
         end)
         twait(0.3) godTeleportUnder()
-        if M.S.DoomTowerEnabled and M._towerDetectedFloorY then
-            twait(0.5)
-            moveTowerToFloor(M._towerDetectedFloorY, M.S.DoomTowerOffset)
-        end
     end
 end)
 
-print("[MzD Hub] Core v12.5 GELADEN (geoptimaliseerd)")
+print("[MzD Hub] Core v13.0 GELADEN")
 
 -- ============================================
--- [MODULE 28] GUI (FLUENT UI)
+-- [MODULE 27] GUI (FLUENT UI)
 -- ============================================
 
 twait(0.5)
@@ -2775,7 +2922,6 @@ pcall(function()
 end)
 twait(0.3)
 
--- KRITIEK: loadstring kan falen als GitHub onbereikbaar is → pcall wrapper
 local Fluent, SaveManager, InterfaceManager
 local ok1, r1 = pcall(function()
     return loadstring(game:HttpGet("https://github.com/dawid-scripts/Fluent/releases/latest/download/main.lua"))()
@@ -2792,7 +2938,7 @@ local ok3, r3 = pcall(function()
 end)
 InterfaceManager = ok3 and r3 or nil
 
--- ========== GUI CONSTANTEN ==========
+-- GUI CONSTANTEN
 local RAR  = M.getAvailableRarities()
 local MUT  = M.getAvailableMutations()
 local FM   = {"Collect", "Collect, Place & Max"}
@@ -2801,14 +2947,13 @@ local SL   = {} for i = 1, 40 do tinsert(SL, tostring(i)) end
 local SPD  = {"200","400","600","800","1000","1500","2000","3000","4000","INSTANT"}
 local SPM  = {["200"]=200,["400"]=400,["600"]=600,["800"]=800,["1000"]=1000,["1500"]=1500,["2000"]=2000,["3000"]=3000,["4000"]=4000,["INSTANT"]=9999}
 local CSPD = {"100","200","300","400","500","600","800","1000","1500","2000"}
-local GODWALKY   = {"5","3","1","0","-1","-2","-3","-5","-8","-10","-15"}
-local GODFLOORY  = {"15","12","10","8","5","3","0","-3","-5","-8","-10","-15","-20"}
-local TOWEROFFSET = {"-5","-3","-2","-1","0","1","2","3","5"}
-local THEMES     = {"Auto","Dark","Doom","Valentine","UFO","Bright"}
+local GODWALKY  = {"5","3","1","0","-1","-2","-3","-5","-8","-10","-15"}
+local GODFLOORY = {"15","12","10","8","5","3","0","-3","-5","-8","-10","-15","-20"}
+local THEMES    = {"Auto","Dark","Doom","Valentine","UFO","Bright"}
 
 local W = Fluent:CreateWindow({
     Title       = "MzD Hub",
-    SubTitle    = "v12.5",
+    SubTitle    = "v13.0",
     TabWidth    = 160,
     Size        = UDim2.fromOffset(640, 540),
     Acrylic     = true,
@@ -2817,7 +2962,7 @@ local W = Fluent:CreateWindow({
 })
 
 -- ========== FARM TAB ==========
-local FT  = W:AddTab({Title = "Farm",    Icon = "leaf"})
+local FT  = W:AddTab({Title = "Farm", Icon = "leaf"})
 local BDD = nil
 
 FT:AddParagraph({Title = "🎯 Brainrot Filters", Content = "Kies rarity, naam en mutatie"})
@@ -2838,9 +2983,9 @@ BDD:OnChanged(function(v)
     M.S.SelectedBrainrots = s
 end)
 
-FT:AddDropdown("FarmMutation", {Title = "💎 Mutatie",    Values = MUT, Default = "None",          Multi = false}):OnChanged(function(v) M.S.TargetMutation = v end)
-FT:AddDropdown("FarmMode",     {Title = "⚙️ Mode",       Values = FM,  Default = M.S.FarmMode,    Multi = false}):OnChanged(function(v) M.S.FarmMode = v end)
-FT:AddDropdown("FarmSlot",     {Title = "📦 Slot",       Values = SL,  Default = M.S.FarmSlot,    Multi = false}):OnChanged(function(v) M.S.FarmSlot = v end)
+FT:AddDropdown("FarmMutation", {Title = "💎 Mutatie",   Values = MUT, Default = "None",        Multi = false}):OnChanged(function(v) M.S.TargetMutation = v end)
+FT:AddDropdown("FarmMode",     {Title = "⚙️ Mode",      Values = FM,  Default = M.S.FarmMode,  Multi = false}):OnChanged(function(v) M.S.FarmMode = v end)
+FT:AddDropdown("FarmSlot",     {Title = "📦 Slot",      Values = SL,  Default = M.S.FarmSlot,  Multi = false}):OnChanged(function(v) M.S.FarmSlot = v end)
 FT:AddSlider("FarmMaxLevel",   {Title = "📈 Max Level", Default = M.S.MaxLevel, Min = 1, Max = 500, Rounding = 0}):OnChanged(function(v) M.S.MaxLevel = mfloor(v) end)
 
 local FSP = FT:AddParagraph({Title = "📊 Farm Status", Content = "Idle"})
@@ -2848,65 +2993,75 @@ local FPP = FT:AddParagraph({Title = "📈 Stats",       Content = "Geplaatst:0 
 local FTG = FT:AddToggle("FarmToggle", {Title = "🌾 Auto Farm", Default = false})
 FTG:OnChanged(function(v) if v then M.findBase() M.startFarming() else M.stopFarming() end end)
 
+-- Lucky Blocks
 FT:AddParagraph({Title = "🎲 Lucky Blocks", Content = ""})
 FT:AddDropdown("LBRarity",   {Title = "⭐ LB Rarity",  Values = LBR, Default = {"Common"}, Multi = true}):OnChanged(function(v)
     local s = {} for n, on in pairs(v) do if on then tinsert(s, n) end end
     if #s == 0 then s = {"Common"} end M.S.LuckyBlockRarity = s
 end)
-FT:AddDropdown("LBMutation", {Title = "💎 LB Mutatie", Values = MUT, Default = "Any",      Multi = false}):OnChanged(function(v) M.S.LuckyBlockMutation = v end)
+FT:AddDropdown("LBMutation", {Title = "💎 LB Mutatie", Values = MUT, Default = "Any",     Multi = false}):OnChanged(function(v) M.S.LuckyBlockMutation = v end)
 local LBSP = FT:AddParagraph({Title = "🎲 LB Status",  Content = "Idle"})
 local LBTG = FT:AddToggle("LBToggle", {Title = "🎲 Auto Lucky Blocks", Default = false})
 LBTG:OnChanged(function(v) if v then M.findBase() M.startLuckyBlockFarm() else M.stopLuckyBlockFarm() end end)
 
+-- Tower Trial Farm (geïntegreerd in Farm Tab)
+FT:AddParagraph({Title = "🏆 Tower Trial Farm", Content = "Auto trial activeren, brainrots ophalen\nen depositen tot het klaar is. Wacht cooldown af.\nGebruikt God Mode beweging als dat aan staat."})
+FT:AddDropdown("TowerTrialSlot", {Title = "📦 Werkslot (referentie)", Values = SL, Default = "5", Multi = false}):OnChanged(function(v)
+    M.S.TowerTrialSlot = v
+end)
+FT:AddSlider("TowerTrialFallbackCd", {Title = "⏱️ Fallback Cooldown (sec)", Default = 305, Min = 60, Max = 600, Rounding = 0}):OnChanged(function(v)
+    M.S.TowerTrialFallbackCd = mfloor(v)
+end)
+
+-- Walk Y fine-tune knoppen (uit v18)
+FT:AddParagraph({Title = "🚶 Walk Y Fine-tune", Content = "Pas Walk Y aan zonder God Mode uit te zetten"})
+FT:AddButton({Title = "Walk Y  −3", Callback = function()
+    M.S.GodWalkY = (M.S.GodWalkY or 0) - 3
+    Fluent:Notify({Title="🚶 Walk Y", Content="Walk Y: "..M.S.GodWalkY, Duration=2})
+    if M._isGod then pcall(function() godTeleportUnder() end) end
+end})
+FT:AddButton({Title = "Walk Y  −1", Callback = function()
+    M.S.GodWalkY = (M.S.GodWalkY or 0) - 1
+    Fluent:Notify({Title="🚶 Walk Y", Content="Walk Y: "..M.S.GodWalkY, Duration=2})
+    if M._isGod then pcall(function() godTeleportUnder() end) end
+end})
+FT:AddButton({Title = "Walk Y  +1", Callback = function()
+    M.S.GodWalkY = (M.S.GodWalkY or 0) + 1
+    Fluent:Notify({Title="🚶 Walk Y", Content="Walk Y: "..M.S.GodWalkY, Duration=2})
+    if M._isGod then pcall(function() godTeleportUnder() end) end
+end})
+FT:AddButton({Title = "Walk Y  +3", Callback = function()
+    M.S.GodWalkY = (M.S.GodWalkY or 0) + 3
+    Fluent:Notify({Title="🚶 Walk Y", Content="Walk Y: "..M.S.GodWalkY, Duration=2})
+    if M._isGod then pcall(function() godTeleportUnder() end) end
+end})
+
+local TTSP = FT:AddParagraph({Title = "🏆 Trial Status", Content = "Idle"})
+local TTTG = FT:AddToggle("TowerTrialToggle", {Title = "🏆 Auto Tower Trial Farm", Default = false})
+TTTG:OnChanged(function(v)
+    if v then M.startTowerTrial() else M.stopTowerTrial() end
+end)
+
 -- ========== FACTORY TAB ==========
 local FCT = W:AddTab({Title = "Factory", Icon = "factory"})
-FCT:AddParagraph({Title = "🏭 Info", Content = "High rarities: alleen plaatsen, niet upgraden"})
+FCT:AddParagraph({Title = "🏭 Factory Info", Content = "Pakt ALLE brainrots van de geselecteerde rarity\nuit je backpack en maakt ze zo snel mogelijk max.\nHigh rarities (Celestial/Divine/Infinity) worden\nalleen geplaatst, niet geupgraded."})
 FCT:AddDropdown("FactoryRarity",   {Title = "⭐ Rarity",   Values = RAR, Default = M.S.FactoryRarity,   Multi = false}):OnChanged(function(v) M.S.FactoryRarity = v end)
 FCT:AddDropdown("FactoryMutation", {Title = "💎 Mutatie",  Values = MUT, Default = M.S.FactoryMutation, Multi = false}):OnChanged(function(v) M.S.FactoryMutation = v end)
-FCT:AddDropdown("FactorySlot",     {Title = "📦 Slot",     Values = SL,  Default = M.S.FactorySlot,     Multi = false}):OnChanged(function(v) M.S.FactorySlot = v end)
-FCT:AddSlider("FactoryMaxLevel", {Title = "📈 Max Level", Default = M.S.FactoryMaxLevel, Min = 1, Max = 500, Rounding = 0}):OnChanged(function(v) M.S.FactoryMaxLevel = mfloor(v) end)
-local FCSP = FCT:AddParagraph({Title = "📊 Status", Content = "Idle"})
+FCT:AddDropdown("FactorySlot",     {Title = "📦 Werkslot", Values = SL,  Default = M.S.FactorySlot,     Multi = false}):OnChanged(function(v) M.S.FactorySlot = v end)
+FCT:AddSlider("FactoryMaxLevel",   {Title = "📈 Max Level", Description = "Niet van toepassing op High rarities", Default = M.S.FactoryMaxLevel, Min = 1, Max = 500, Rounding = 0}):OnChanged(function(v) M.S.FactoryMaxLevel = mfloor(v) end)
+local FCSP = FCT:AddParagraph({Title = "📊 Factory Status", Content = "Idle"})
 local FCTG = FCT:AddToggle("FactoryToggle", {Title = "🏭 Start Factory", Default = false})
-FCTG:OnChanged(function(v) if v then M.findBase() M.startFactoryLoop() else M.stopFactoryLoop() end end)
+FCTG:OnChanged(function(v)
+    if v then M.findBase() M.startFactoryLoop() else M.stopFactoryLoop() end
+end)
 
 -- ========== EVENTS TAB ==========
 local ET = W:AddTab({Title = "Events", Icon = "party-popper"})
 
-ET:AddParagraph({Title = "🌋 Doom Event", Content = "Coins + Tower mover"})
+ET:AddParagraph({Title = "🌋 Doom Event", Content = "Auto doom coins verzamelen"})
 local DMSP = ET:AddParagraph({Title = "🪙 Doom Status", Content = "Uit"})
 local DMTG = ET:AddToggle("DoomToggle", {Title = "🪙 Auto Doom Coins", Default = false})
 DMTG:OnChanged(function(v) if v then M.startDoomCollector() else M.stopDoomCollector() end end)
-
-ET:AddDropdown("TowerOffset", {Title = "🗼 Tower Offset", Values = TOWEROFFSET, Default = "0", Multi = false}):OnChanged(function(v)
-    M.S.DoomTowerOffset = tonumber(v) or 0
-    if M.S.DoomTowerEnabled and M._towerDetectedFloorY then
-        moveTowerToFloor(M._towerDetectedFloorY, M.S.DoomTowerOffset)
-    end
-end)
-
-local DTSP = ET:AddParagraph({Title = "🗼 Tower Status", Content = "Uit"})
-local DTTG = ET:AddToggle("DoomTowerToggle", {Title = "🗼 Tower naar Vloer", Default = false})
-DTTG:OnChanged(function(v) if v then M.enableTowerDrop() else M.disableTowerDrop() end end)
-
-ET:AddButton({Title = "🔍 Tower Info", Callback = function()
-    local y, source = detectFloorY()
-    local tY, bY   = getTowerY(), getTowerBottomY()
-    local info = "Vloer: Y="..sformat("%.1f",y).." ("..source..")"
-    if tY then info = info.."\nTower Pivot: Y="..sformat("%.1f",tY) end
-    if bY then info = info.."\nTower Bottom: Y="..sformat("%.1f",bY) end
-    Fluent:Notify({Title = "🌋 Detection", Content = info, Duration = 8})
-end})
-
-ET:AddButton({Title = "⚡ Doom Alles Aan", Callback = function()
-    if not M.S.DoomTowerEnabled then M.enableTowerDrop() pcall(function() DTTG:SetValue(true) end) end
-    if not M.S.DoomEnabled      then M.startDoomCollector() pcall(function() DMTG:SetValue(true) end) end
-    Fluent:Notify({Title="🌋 Doom", Content="Tower + Coins actief!", Duration=3})
-end})
-ET:AddButton({Title = "⏹ Doom Alles Uit", Callback = function()
-    if M.S.DoomEnabled      then M.stopDoomCollector()  pcall(function() DMTG:SetValue(false) end) end
-    if M.S.DoomTowerEnabled then M.disableTowerDrop()   pcall(function() DTTG:SetValue(false) end) end
-    Fluent:Notify({Title="🌋 Doom", Content="Gestopt + hersteld", Duration=3})
-end})
 
 ET:AddParagraph({Title = "💝 Valentine / Candy", Content = "ValentinesCoinParts + CandyEventParts\n100 hearts → submit bij station"})
 local VSP = ET:AddParagraph({Title = "💝 Status", Content = "Idle"})
@@ -2914,7 +3069,6 @@ local VTG = ET:AddToggle("ValentineToggle", {Title = "💝 Auto Valentine", Defa
 VTG:OnChanged(function(v) if v then M.startValentine() else M.stopValentine() end end)
 
 ET:AddButton({Title = "💝 Info", Callback = function()
-    local stationPos  = M.getStationPosition()
     local coinFolder  = workspace:FindFirstChild("ValentinesCoinParts")
     local candyFolder = workspace:FindFirstChild("CandyEventParts")
     local info = "Hearts: "..M.getHeartCount().."/100"
@@ -2922,7 +3076,6 @@ ET:AddButton({Title = "💝 Info", Callback = function()
     info = info.."\nCandyParts: "..(candyFolder and #candyFolder:GetChildren() or 0).." (cached: "..#M._candyCachedParts..")"
     local station = M.findCandyGramStation()
     info = info.."\nStation: "..(station and station.Name or "NIET GEVONDEN")
-    if stationPos then info = info.."\nPos: "..sformat("%.0f,%.0f,%.0f",stationPos.X,stationPos.Y,stationPos.Z) end
     Fluent:Notify({Title="💝 Valentine Info", Content=info, Duration=8})
 end})
 ET:AddButton({Title = "💝 Submit Nu (1x)", Callback = function()
@@ -2965,7 +3118,10 @@ AT2:AddButton({Title = "🗑️ Verwijder Deco", Callback = function()
 end})
 
 AT2:AddParagraph({Title = "😇 God Mode", Content = ""})
-AT2:AddDropdown("GodWalkY",  {Title = "🚶 Loop Y",  Values = GODWALKY,  Default = "0",   Multi = false}):OnChanged(function(v) M.S.GodWalkY  = tonumber(v) or 0   if M._isGod then godTeleportUnder() end end)
+AT2:AddDropdown("GodWalkY",  {Title = "🚶 Loop Y",  Values = GODWALKY,  Default = "0",   Multi = false}):OnChanged(function(v)
+    M.S.GodWalkY = tonumber(v) or 0
+    if M._isGod then godTeleportUnder() end
+end)
 AT2:AddDropdown("GodFloorY", {Title = "🟫 Vloer Y", Values = GODFLOORY, Default = "-10", Multi = false}):OnChanged(function(v)
     M.S.GodFloorY = tonumber(v) or -10
     if M._isGod then
@@ -2986,7 +3142,9 @@ GDTG:OnChanged(function(v) if v then M.enableGod() else M.disableGod() end end)
 AT2:AddButton({Title = "📍 Teleport Onder", Callback = function() if M._isGod then godTeleportUnder() end end})
 
 AT2:AddParagraph({Title = "🔧 Overig", Content = ""})
-AT2:AddToggle("InstantToggle", {Title = "⚡ Instant Pickup", Default = true}):OnChanged(function(v) M.S.InstantPickup = v if v then M.setupInstant() end end)
+AT2:AddToggle("InstantToggle", {Title = "⚡ Instant Pickup", Default = true}):OnChanged(function(v)
+    M.S.InstantPickup = v if v then M.setupInstant() end
+end)
 local AFKSP = AT2:AddParagraph({Title = "🕐 AFK Status", Content = "Uit"})
 local AFKTG = AT2:AddToggle("AFKToggle", {Title = "🕐 Anti-AFK", Default = false})
 AFKTG:OnChanged(function(v) if v then M.startAFK() else M.stopAFK() end end)
@@ -3002,30 +3160,44 @@ CT:AddDropdown("WallTheme",    {Title = "🎨 Thema",          Values = THEMES, 
     if M._isGod then M.disableGod() twait(0.3) M.enableGod() end
 end)
 
-CT:AddParagraph({Title = "🔎 GUI Schaal", Content = "50%–150% in stappen van 10%"})
-CT:AddSlider("GuiScale", {Title = "🔎 Schaal %", Default = 100, Min = 50, Max = 150, Rounding = 0}):OnChanged(function(v)
-    local scale = mfloor(v/10 + 0.5) * 10 / 100
-    M.S.GuiScale = scale
-    pcall(function()
-        for _, gui in pairs(Player.PlayerGui:GetChildren()) do
-            if gui:IsA("ScreenGui") then
-                for _, child in pairs(gui:GetChildren()) do
-                    if child:IsA("Frame") then
-                        local isFluent = false
-                        for _, d in pairs(child:GetDescendants()) do
-                            if d:IsA("TextLabel") and (d.Text == "MzD Hub" or d.Text == "v12.5") then
-                                isFluent = true break
-                            end
-                        end
-                        if isFluent then
-                            local uiScale = child:FindFirstChildOfClass("UIScale")
-                            if not uiScale then uiScale = Instance.new("UIScale") uiScale.Parent = child end
-                            uiScale.Scale = scale
+-- GUI Scale — werkende implementatie
+-- Fluent plaatst zijn hoofdframe direct in een ScreenGui.
+-- We bewaren een referentie naar dat frame zodra de GUI bestaat.
+local _fluentRootFrame = nil
+local function findFluentRoot()
+    if _fluentRootFrame and _fluentRootFrame.Parent then return _fluentRootFrame end
+    for _, gui in pairs(Player.PlayerGui:GetChildren()) do
+        if gui:IsA("ScreenGui") then
+            for _, child in pairs(gui:GetChildren()) do
+                if child:IsA("Frame") and child.Size.X.Offset > 300 then
+                    -- Controleer of er een TextLabel met "MzD Hub" in zit
+                    for _, d in pairs(child:GetDescendants()) do
+                        if d:IsA("TextLabel") and d.Text == "MzD Hub" then
+                            _fluentRootFrame = child
+                            return child
                         end
                     end
                 end
             end
         end
+    end
+    return nil
+end
+
+CT:AddParagraph({Title = "🔎 GUI Schaal", Content = "50%–150% in stappen van 10%"})
+CT:AddSlider("GuiScale", {Title = "🔎 Schaal %", Default = 100, Min = 50, Max = 150, Rounding = 0}):OnChanged(function(v)
+    local step  = mfloor(v / 10 + 0.5) * 10
+    local scale = step / 100
+    M.S.GuiScale = scale
+    pcall(function()
+        local root = findFluentRoot()
+        if not root then return end
+        local uiScale = root:FindFirstChildOfClass("UIScale")
+        if not uiScale then
+            uiScale = Instance.new("UIScale")
+            uiScale.Parent = root
+        end
+        uiScale.Scale = scale
     end)
 end)
 
@@ -3055,18 +3227,17 @@ CT:AddButton({Title = "🗑️ Leeg Farm Slot", Callback = function()
 end})
 CT:AddButton({Title = "🏠 Ga Naar Base",   Callback = function() M.findBase() M.returnToBase() end})
 CT:AddButton({Title = "📡 Debug Info",     Callback = function()
-    local info = "God:"   ..(M._isGod and "AAN" or "UIT")
+    local info = "God:"..(M._isGod and "AAN" or "UIT")
     info = info.."\nWalk:"..M.S.GodWalkY.." Floor:"..M.S.GodFloorY
     info = info.."\nDoom:"..(M.S.DoomEnabled and "AAN" or "UIT").." Parts:"..#M._doomCachedParts
-    info = info.."\nTower:"..(M._towerMoved and "Moved" or "Off")
-    local tY = getTowerY() if tY then info = info.." Y:"..sformat("%.1f",tY) end
     local hrp = Player.Character and Player.Character:FindFirstChild("HumanoidRootPart")
     if hrp then info = info.."\nPlayer Y:"..sformat("%.1f",hrp.Position.Y) end
     info = info.."\nGUID:"..(M.baseGUID or "?").."\nSlots:"..M.getSlotCount()
     info = info.."\nRemote:"..(M.PlotAction and "OK" or "NIET GEVONDEN!")
     info = info.."\nCandy:"..#M._candyCachedParts
+    info = info.."\nTrial:"..(M._towerTrialEnabled and "AAN" or "UIT").." #"..M.Status.towerTrialCount
     info = info.."\nScale:"..mfloor(M.S.GuiScale*100).."%"
-    Fluent:Notify({Title="📡 Debug v12.5", Content=info, Duration=12})
+    Fluent:Notify({Title="📡 Debug v13.0", Content=info, Duration=12})
 end})
 
 local IP = CT:AddParagraph({Title = "ℹ️ Info", Content = "..."})
@@ -3081,7 +3252,7 @@ if SaveManager and InterfaceManager then
 end
 
 -- ============================================
--- [MODULE 29] STATUS UPDATE LOOP
+-- [MODULE 28] STATUS UPDATE LOOP
 -- ============================================
 
 tspawn(function()
@@ -3090,8 +3261,14 @@ tspawn(function()
             FSP:SetDesc((M.S.Farming and M.Status.farm or "Idle").." | #"..M.Status.farmCount)
             FPP:SetDesc("Geplaatst:"..M.Status.placeCount.." | Geupgrade:"..M.Status.upgradeCount)
             if not M.S.Farming         then pcall(function() if FTG.Value  then FTG:SetValue(false)  end end) end
+
             LBSP:SetDesc((M.S.LuckyBlockEnabled and M.Status.luckyBlock or "Idle").." #"..M.Status.luckyBlockCount)
             if not M.S.LuckyBlockEnabled then pcall(function() if LBTG.Value then LBTG:SetValue(false) end end) end
+
+            -- Tower Trial status
+            TTSP:SetDesc(M.Status.towerTrial or "Idle")
+            if not M._towerTrialEnabled then pcall(function() if TTTG.Value then TTTG:SetValue(false) end end) end
+
             FCSP:SetDesc((M.Status.factory or "Idle").." #"..M.Status.factoryCount)
             if not M.S.FactoryEnabled  then pcall(function() if FCTG.Value then FCTG:SetValue(false) end end) end
 
@@ -3100,11 +3277,6 @@ tspawn(function()
                 DMSP:SetDesc("AAN | Parts:"..#M._doomCachedParts.." | Folder:"..(fc and #fc:GetChildren() or 0))
             else DMSP:SetDesc("Uit") end
             if not M.S.DoomEnabled then pcall(function() if DMTG.Value then DMTG:SetValue(false) end end) end
-
-            if M.S.DoomTowerEnabled then
-                DTSP:SetDesc("AAN | Y:"..(getTowerY() and sformat("%.0f",getTowerY()) or "?").." Bot:"..(getTowerBottomY() and sformat("%.0f",getTowerBottomY()) or "?").." Off:"..M.S.DoomTowerOffset)
-            else DTSP:SetDesc("Uit") end
-            if not M.S.DoomTowerEnabled then pcall(function() if DTTG.Value then DTTG:SetValue(false) end end) end
 
             VSP:SetDesc(M.S.ValentineEnabled and (M.Status.valentine.." | 🍬 "..#M._candyCachedParts) or "Idle")
             if not M.S.ValentineEnabled then pcall(function() if VTG.Value then VTG:SetValue(false) end end) end
@@ -3129,23 +3301,29 @@ tspawn(function()
 
             local hrp = Player.Character and Player.Character:FindFirstChild("HumanoidRootPart")
             local curY = hrp and sformat("%.1f", hrp.Position.Y) or "?"
-            IP:SetDesc("👤 "..Player.Name.."\n🏠 "..(M.baseGUID or "?").."\n📦 "..M.getSlotCount().."\n😇 "..(M._isGod and "AAN" or "UIT").."\n🎨 "..(M.S.WallTheme or "Dark").."\n📍 Y:"..curY.."\n🔎 "..mfloor(M.S.GuiScale*100).."%")
+            IP:SetDesc("👤 "..Player.Name
+                .."\n🏠 "..(M.baseGUID or "?")
+                .."\n📦 "..M.getSlotCount()
+                .."\n😇 "..(M._isGod and "AAN" or "UIT")
+                .."\n🎨 "..(M.S.WallTheme or "Dark")
+                .."\n📍 Y:"..curY
+                .."\n🔎 "..mfloor(M.S.GuiScale*100).."%")
         end)
     end
 end)
 
 -- ============================================
--- [MODULE 30] STARTUP
+-- [MODULE 29] STARTUP
 -- ============================================
 
 tspawn(function()
     twait(1) M.findBase() twait(0.5) M.detectWallZ()
     Fluent:Notify({
-        Title   = "MzD Hub v12.5",
-        Content = "✅ Geoptimaliseerd geladen\n✅ Candy + Valentine collectors actief\n✅ GUI Scale slider beschikbaar",
+        Title   = "MzD Hub v13.0",
+        Content = "✅ Factory fix: alle brainrots + zo snel mogelijk max\n✅ Tower Trial Farm in Farm Tab\n✅ Doom Coins conflict-fix\n✅ isMzDPart bug gefixed\n✅ GUI Scale werkend",
         Duration = 8
     })
 end)
 
 W:SelectTab(1)
-print("[MzD Hub] v12.5 GEOPTIMALISEERD GELADEN")
+print("[MzD Hub] v13.0 GELADEN")
